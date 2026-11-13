@@ -50,3 +50,21 @@ jobs:
       working_directory: fixtures/python-lib
       src_dir: src
       ci_workflows_ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+  imageonly:
+    uses: ./.github/workflows/image-only.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      image_name: ci-workflows-image-selftest
+      working_directory: fixtures/image-only
+      # The fixture turns the build arg into ENV; the smoke reads it back from the running
+      # container, so a dropped --build-arg cannot pass.
+      build_args: GREETING=hi
+      ci_workflows_ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      build_smoke: |
+        set -euo pipefail
+        docker run --rm "$IMAGE_REF" sh -c 'test "$GREETING" = hi'
+        echo "build arg reached the image"
+
