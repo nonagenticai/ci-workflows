@@ -64,6 +64,37 @@ on:
         value: ${{ jobs.image.outputs.image_digest }}
 
 jobs:
+  # A public repo's own tree still has to be publishable: an image-only repo carries source,
+  # fixtures and docs even when the build is a Dockerfile. Same two gates the python archetypes
+  # ship, so no public repo is born without them.
+  secret-scan:
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: nonagenticai/ci-workflows
+          ref: ${{ inputs.ci_workflows_ref || 'main' }}
+          path: .ci-workflows
+      - name: Scan the tree
+        run: bash .ci-workflows/scripts/secret-scan.sh
+
+  no-private-refs:
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: nonagenticai/ci-workflows
+          ref: ${{ inputs.ci_workflows_ref || 'main' }}
+          path: .ci-workflows
+      - name: Scan tracked files
+        run: bash .ci-workflows/scripts/no-private-refs.sh
+
   image:
     if: ${{ !github.event.repository.private }}
     runs-on: ubuntu-latest
