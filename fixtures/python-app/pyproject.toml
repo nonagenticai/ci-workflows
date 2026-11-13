@@ -28,6 +28,7 @@ packages = ["src/app"]
 pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "-m 'not integration'"
+markers = ["integration: needs the CI database"]
 
 [tool.ruff]
 line-length = 100

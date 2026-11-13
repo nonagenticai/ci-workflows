@@ -80,7 +80,10 @@ on:
         type: boolean
         default: false
       db_bootstrap_cmd:
-        description: "Shell command run (from working_directory) once the database is up."
+        description: |
+          Shell command run (from working_directory) in the SAME shell as the DB-integration
+          pytest, immediately before it — so anything it exports is visible to the tests.
+          Only runs when integration_test_select is set. Empty = skip.
         type: string
         default: ""
       integration_test_select:
@@ -215,15 +218,20 @@ jobs:
           # Disk-backed named volume, NOT a --tmpfs: conveyor measured the RAM-capped tmpfs
           # running out after ~1000 test databases (md.c, "No space left on device").
           # --shm-size=1g: the 64 MB default breaks Postgres parallel workers (dsm_impl.c).
+          # ⚠️ Mount at /var/lib/postgresql, NOT /var/lib/postgresql/data: the postgres:18
+          # image moved PGDATA into a version subdirectory and REFUSES to start on the old
+          # mount point (measured 2026-11-13 — the container exits 1 and --rm erases it).
           docker volume create cipg >/dev/null
-          docker run --rm -d --name cipg \
+          if ! out="$(docker run -d --name cipg \
             -p 127.0.0.1:5432:5432 \
             --shm-size=1g \
             -e POSTGRES_USER=ci_test -e POSTGRES_PASSWORD=ci_test -e POSTGRES_DB="$DB" \
-            -v cipg:/var/lib/postgresql/data \
+            -v cipg:/var/lib/postgresql \
             pgvector/pgvector:pg18 \
             -c fsync=off -c max_connections=300 \
-            -c checkpoint_timeout=30s -c max_wal_size=256MB >/dev/null
+            -c checkpoint_timeout=30s -c max_wal_size=256MB 2>&1)"; then
+            echo "::error::docker run failed for the CI database"; echo "$out"; exit 1
+          fi
           for i in $(seq 1 90); do
             if docker exec cipg pg_isready -U ci_test -d "$DB" >/dev/null 2>&1; then
               echo "postgres ready (attempt $i)"; break
@@ -284,10 +292,6 @@ jobs:
         if: inputs.alembic
         run: uv run alembic upgrade head
 
-      - name: Bootstrap CI database
-        if: inputs.has_postgres && inputs.db_bootstrap_cmd != ''
-        run: ${{ inputs.db_bootstrap_cmd }}
-
       - name: Ruff lint
         run: uv run ruff check .
 
@@ -328,9 +332,21 @@ jobs:
           REDIS_PORT: 6379
         run: uv run ${{ steps.flags.outputs.with }} pytest ${{ inputs.test_dir }} -v --tb=short ${{ steps.flags.outputs.unit_args }} ${{ steps.flags.outputs.no_cov }}
 
+      # ⛔ The bootstrap runs HERE, in the same shell as the pytest it precedes — never in a
+      # step of its own. A caller's bootstrap usually *exports* something the tests read
+      # (`db_bootstrap_cmd: export TEST_DATABASE_URL=$DATABASE_URL`); an export in a previous
+      # step dies with that step's shell, so the tests run without it. Measured on
+      # coding-analysis, run 43414596003: the private archetype runs this prefix inline, the
+      # public one had split it out, and the integration pass failed on the missing DSN.
       - name: DB integration tests
         if: inputs.has_postgres && inputs.integration_test_select != ''
-        run: uv run ${{ steps.flags.outputs.with }} pytest ${{ inputs.integration_test_select }} -v --tb=short ${{ steps.flags.outputs.integration_args }} ${{ steps.flags.outputs.no_cov }}
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.db_bootstrap_cmd }}" ]; then
+            echo "Bootstrapping CI DB: ${{ inputs.db_bootstrap_cmd }}"
+            ${{ inputs.db_bootstrap_cmd }}
+          fi
+          uv run ${{ steps.flags.outputs.with }} pytest ${{ inputs.integration_test_select }} -v --tb=short ${{ steps.flags.outputs.integration_args }} ${{ steps.flags.outputs.no_cov }}
 
       # The input is passed through env, never interpolated, and every name must be a dotted
       # Python identifier — a caller cannot smuggle shell through it.
@@ -421,14 +437,21 @@ jobs:
         run: |
           set -euo pipefail
           short="${GITHUB_SHA:0:7}"
-          docker tag "$IMAGE:ci" "$IMAGE:sha-$short"
-          docker tag "$IMAGE:ci" "$IMAGE:latest"
-          docker push "$IMAGE:sha-$short"
-          docker push "$IMAGE:latest"
-          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:latest")"
-          echo "published $digest"
+          # buildx --push, not `docker tag` + `docker push`: on the runner's Docker 29 containerd
+          # image store the classic push path dies with "unknown blob" after the first layer
+          # (measured 2026-11-13, run 43391868497). buildx re-uses the build cache, so this is a
+          # cache-hit rebuild plus a correct registry upload.
+          docker buildx build \
+            --push \
+            --tag "$IMAGE:sha-$short" \
+            --tag "$IMAGE:latest" \
+            --file "${{ inputs.dockerfile }}" \
+            --metadata-file "$RUNNER_TEMP/meta.json" \
+            .
+          digest="$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/meta.json")"
+          echo "published $IMAGE@$digest"
           {
             echo "### image published"
-            echo "- \`$digest\`"
-            echo "- ticks: \`sha-$short\`, \`latest\`"
+            echo "- \`$IMAGE@$digest\`"
+            echo "- tags: \`sha-$short\`, \`latest\`"
           } >> "$GITHUB_STEP_SUMMARY"
