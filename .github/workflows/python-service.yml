@@ -426,14 +426,21 @@ jobs:
         run: |
           set -euo pipefail
           short="${GITHUB_SHA:0:7}"
-          docker tag "$IMAGE:ci" "$IMAGE:sha-$short"
-          docker tag "$IMAGE:ci" "$IMAGE:latest"
-          docker push "$IMAGE:sha-$short"
-          docker push "$IMAGE:latest"
-          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:latest")"
-          echo "published $digest"
+          # buildx --push, not `docker tag` + `docker push`: on the runner's Docker 29 containerd
+          # image store the classic push path dies with "unknown blob" after the first layer
+          # (measured 2026-11-13, run 43391868497). buildx re-uses the build cache, so this is a
+          # cache-hit rebuild plus a correct registry upload.
+          docker buildx build \
+            --push \
+            --tag "$IMAGE:sha-$short" \
+            --tag "$IMAGE:latest" \
+            --file "${{ inputs.dockerfile }}" \
+            --metadata-file "$RUNNER_TEMP/meta.json" \
+            .
+          digest="$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/meta.json")"
+          echo "published $IMAGE@$digest"
           {
             echo "### image published"
-            echo "- \`$digest\`"
-            echo "- ticks: \`sha-$short\`, \`latest\`"
+            echo "- \`$IMAGE@$digest\`"
+            echo "- tags: \`sha-$short\`, \`latest\`"
           } >> "$GITHUB_STEP_SUMMARY"
