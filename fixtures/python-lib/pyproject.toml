@@ -1,0 +1,31 @@
+[project]
+name = "demo-lib"
+version = "0.1.0"
+description = "Selftest fixture for the public python-library workflow"
+requires-python = ">=3.14"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest>=9",
+    "ruff>=0.17",
+    "ty>=0.0.92",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/demo_lib"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ty.environment]
+python-version = "3.14"

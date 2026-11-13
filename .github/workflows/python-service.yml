@@ -1,0 +1,434 @@
+# The public python-service pipeline.
+#
+# WHY THIS FILE EXISTS. A public repository may only call PUBLIC reusable workflows, so the
+# private archetype (`gitops-production/.github/workflows/python-service.yml`) cannot be used by
+# any repository once it is public. This is its public counterpart: the same gates, none of the
+# estate's private plumbing.
+#
+# WHAT IS DELIBERATELY ABSENT, and why (the private archetype has all of it):
+#   * registry login / the estate's internal registry mirror — a public repo builds from Docker Hub
+#   * sccache, registry build cache                — estate-side infrastructure
+#   * rmt-drift-guard, lock-downgrade-guard        — private composite actions; lock freshness
+#     is still gated here by `uv lock --check`
+#   * Flux receiver, `:latest` promote, kubectl rollout wait — DEPLOY IS NOT IN THIS REPO.
+#     Images are pushed to ghcr; Flux in gitops-production watches the ImagePolicy.
+#   * validate-no-upstream-refs — that private gate FORBIDS docker.io refs, the exact opposite
+#     of what a public repo needs. `no-private-refs` replaces it: it refuses internal-only host
+#     names and tailnet addresses, which is the rule that matters when publishing.
+#
+# ZERO REPO SECRETS. Nothing here references `secrets.*`; the only token is the automatic
+# `github.token`, used solely to push an image from main. A fork PR gets a read-only token and no
+# secrets by construction — there is no `pull_request_target` and no `workflow_run`.
+#
+# EVERY JOB IS GATED on `!github.event.repository.private` so a consumer can add its calling job
+# while the repo is still private (the called jobs report "skipped", never red) and activate with
+# no edit at the moment of the public flip. The caller gates too; this is the belt-and-braces.
+---
+name: python-service-public
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: "Image name to build; published as ghcr.io/<registry_owner>/<image_name>."
+        type: string
+        required: true
+      registry_owner:
+        description: "ghcr owner (org) the image is published under."
+        type: string
+        default: nonagenticai
+      python_version:
+        description: "Python version for setup-uv."
+        type: string
+        default: "3.14"
+      uv_version:
+        description: |
+          uv version. Default matches the `ghcr.io/astral-sh/uv` image pinned in every
+          consumer's Dockerfile, so CI and the image build resolve the same lock the same way.
+        type: string
+        default: "0.13.7"
+      src_dir:
+        description: "Source directory for bandit + ty (relative to working_directory)."
+        type: string
+        default: "src"
+      test_dir:
+        description: "Pytest target."
+        type: string
+        default: "tests/"
+      working_directory:
+        description: "Directory the project lives in, relative to the repo root."
+        type: string
+        default: "."
+      dockerfile:
+        description: "Dockerfile path, relative to working_directory."
+        type: string
+        default: "Dockerfile"
+      uv_sync_args:
+        description: "Arguments to `uv sync`."
+        type: string
+        default: "--all-extras"
+      has_postgres:
+        description: "Start an ephemeral pgvector/pgvector:pg18 and export DATABASE_URL + PG_*."
+        type: boolean
+        default: false
+      database_name:
+        description: "Database name. Empty = '<image_name>_ci'."
+        type: string
+        default: ""
+      alembic:
+        description: "Assert a single alembic head, then `alembic upgrade head`, against the sidecar."
+        type: boolean
+        default: false
+      db_bootstrap_cmd:
+        description: "Shell command run (from working_directory) once the database is up."
+        type: string
+        default: ""
+      integration_test_select:
+        description: "Pytest target for database integration tests. Empty = skip."
+        type: string
+        default: ""
+      has_redis:
+        description: "Start an ephemeral redis sidecar."
+        type: boolean
+        default: false
+      extra_apt:
+        description: "Space-separated apt packages installed before uv sync."
+        type: string
+        default: ""
+      oracle_modules:
+        description: "Space-separated importable modules to execute after the test suite."
+        type: string
+        default: ""
+      pip_audit_ignores:
+        description: "Space-separated --ignore-vuln flags. Empty = no ignores."
+        type: string
+        default: ""
+      enable_security_scans:
+        description: "Run bandit + pip-audit."
+        type: boolean
+        default: true
+      build_smoke:
+        description: |
+          Shell snippet proving the built image works. Receives $IMAGE_REF. Empty = skip.
+          Same contract as the private archetype's `build_smoke`, so consumers keep their
+          existing snippet unchanged.
+        type: string
+        default: ""
+      build_timeout_minutes:
+        description: "Timeout for the image job."
+        type: number
+        default: 60
+      test_timeout_seconds:
+        description: "Per-test timeout injected when the project does not provide pytest-timeout."
+        type: number
+        default: 300
+      integration_test_timeout_seconds:
+        description: "Per-test timeout for integration tests."
+        type: number
+        default: 600
+      ci_workflows_ref:
+        description: |
+          Commit/branch of THIS repository whose scripts/ and fleet betterleaks config are used.
+          Consumers leave it empty (= `main`, the ref they pin in `uses:`); the selftest passes
+          its own sha.
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  # A secret is a fact about the tree, not about whether the build works, so this runs in
+  # parallel and gates nothing. Dir mode over the whole tree: for a public repo a pre-existing
+  # credential is a leak whether or not the current PR touched it.
+  secret-scan:
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: nonagenticai/ci-workflows
+          ref: ${{ inputs.ci_workflows_ref || 'main' }}
+          path: .ci-workflows
+      - name: Scan the tree
+        run: bash .ci-workflows/scripts/secret-scan.sh
+
+  # Private infrastructure must not be published. The secret scan catches credentials; this
+  # catches the other half of the rule: internal hostnames, tailnet addresses, private repo
+  # paths, in every tracked file including docs and fixtures.
+  no-private-refs:
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: nonagenticai/ci-workflows
+          ref: ${{ inputs.ci_workflows_ref || 'main' }}
+          path: .ci-workflows
+      - name: Scan tracked files
+        run: bash .ci-workflows/scripts/no-private-refs.sh
+
+  checks:
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install extra apt packages
+        if: inputs.extra_apt != ''
+        working-directory: .
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends -o Acquire::ForceIPv4=true ${{ inputs.extra_apt }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          version: ${{ inputs.uv_version }}
+          python-version: ${{ inputs.python_version }}
+          enable-cache: true
+          cache-dependency-glob: "**/uv.lock"
+
+      # The private archetype enforces this in a composite action (lock-downgrade-guard);
+      # the freshness half is available natively and is the half that matters here — a lock
+      # that no longer matches pyproject.toml must never reach the image build.
+      - name: Lockfile freshness (uv.lock vs pyproject.toml)
+        run: uv lock --check
+
+      - name: Install dependencies
+        id: install-deps
+        run: uv sync ${{ inputs.uv_sync_args }}
+
+      - name: Start ephemeral postgres
+        if: inputs.has_postgres
+        working-directory: .
+        run: |
+          set -euo pipefail
+          DB='${{ inputs.database_name }}'
+          [ -n "$DB" ] || DB='${{ inputs.image_name }}_ci'
+          # Disk-backed named volume, NOT a --tmpfs: conveyor measured the RAM-capped tmpfs
+          # running out after ~1000 test databases (md.c, "No space left on device").
+          # --shm-size=1g: the 64 MB default breaks Postgres parallel workers (dsm_impl.c).
+          docker volume create cipg >/dev/null
+          docker run --rm -d --name cipg \
+            -p 127.0.0.1:5432:5432 \
+            --shm-size=1g \
+            -e POSTGRES_USER=ci_test -e POSTGRES_PASSWORD=ci_test -e POSTGRES_DB="$DB" \
+            -v cipg:/var/lib/postgresql/data \
+            pgvector/pgvector:pg18 \
+            -c fsync=off -c max_connections=300 \
+            -c checkpoint_timeout=30s -c max_wal_size=256MB >/dev/null
+          for i in $(seq 1 90); do
+            if docker exec cipg pg_isready -U ci_test -d "$DB" >/dev/null 2>&1; then
+              echo "postgres ready (attempt $i)"; break
+            fi
+            [ "$i" -eq 90 ] && { echo "::error::ephemeral postgres did not become ready in 90s"; docker logs cipg || true; exit 1; }
+            sleep 1
+          done
+          {
+            echo "POSTGRES_CI_HOST=127.0.0.1"
+            echo "POSTGRES_CI_PORT=5432"
+            echo "POSTGRES_CI_USER=ci_test"
+            echo "POSTGRES_CI_PASSWORD=ci_test"
+            echo "DATABASE_URL=postgresql+psycopg://ci_test:ci_test@127.0.0.1:5432/$DB"
+            echo "PG_HOST=127.0.0.1"
+            echo "PG_PORT=5432"
+            echo "PG_USER=ci_test"
+            echo "PG_PASSWORD=ci_test"
+            echo "PGOPTIONS=-c statement_timeout=300s"
+            echo "PG_SCHEMA=public"
+            echo "PG_DATABASE=$DB"
+          } >> "$GITHUB_ENV"
+
+      - name: Start ephemeral redis
+        if: inputs.has_redis
+        working-directory: .
+        run: |
+          set -euo pipefail
+          docker run --rm -d --name ciredis -p 127.0.0.1:6379:6379 redis:7-alpine >/dev/null
+          for i in $(seq 1 60); do
+            if [ "$(docker exec ciredis redis-cli ping 2>/dev/null)" = "PONG" ]; then
+              echo "redis ready (attempt $i)"; break
+            fi
+            [ "$i" -eq 60 ] && { echo "::error::ephemeral redis did not become ready in 60s"; docker logs ciredis || true; exit 1; }
+            sleep 1
+          done
+
+      - name: Assert single alembic head
+        if: inputs.alembic
+        run: |
+          set -euo pipefail
+          err="$(mktemp)"
+          rc=0
+          out="$(uv run alembic heads 2>"$err")" || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::'uv run alembic heads' FAILED (exit $rc) — the migration set could not be loaded. This is not a migration race: check for an import/syntax error in a revision file or a missing dependency."
+            cat "$err" >&2
+            exit 1
+          fi
+          n="$(printf '%s\n' "$out" | grep -c . || true)"
+          printf '%s\n' "$out"
+          if [ "$n" -ne 1 ]; then
+            echo "::error::expected exactly 1 alembic head, got $n. A migration race created divergent heads; rebase and 'uv run alembic merge heads'."
+            exit 1
+          fi
+          echo "alembic single-head check OK"
+
+      - name: Run alembic migrations
+        if: inputs.alembic
+        run: uv run alembic upgrade head
+
+      - name: Bootstrap CI database
+        if: inputs.has_postgres && inputs.db_bootstrap_cmd != ''
+        run: ${{ inputs.db_bootstrap_cmd }}
+
+      - name: Ruff lint
+        run: uv run ruff check .
+
+      - name: Ruff format check
+        run: uv run ruff format --check --config "extend-exclude=['*.md']" .
+
+      - name: Type check (ty)
+        run: uv run ty check ${{ inputs.src_dir }}
+
+      # Mirrors the archetype: use the project's own pytest-timeout when it has one, otherwise
+      # inject one so a hung test cannot burn the whole job budget.
+      - name: Resolve test flags
+        id: flags
+        run: |
+          set -euo pipefail
+          {
+            if uv run python -c "import pytest_timeout" >/dev/null 2>&1; then
+              echo "with="
+              echo "unit_args="
+              echo "integration_args="
+            else
+              echo "with=--with pytest-timeout"
+              echo "unit_args=--timeout=${{ inputs.test_timeout_seconds }} --timeout-method=thread"
+              echo "integration_args=--timeout=${{ inputs.integration_test_timeout_seconds }} --timeout-method=thread"
+            fi
+          } >> "$GITHUB_OUTPUT"
+          {
+            if uv run python -c "import pytest_cov" >/dev/null 2>&1; then
+              echo "no_cov=--no-cov"
+            else
+              echo "no_cov="
+            fi
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run tests
+        env:
+          REDIS_HOST: 127.0.0.1
+          REDIS_PORT: 6379
+        run: uv run ${{ steps.flags.outputs.with }} pytest ${{ inputs.test_dir }} -v --tb=short ${{ steps.flags.outputs.unit_args }} ${{ steps.flags.outputs.no_cov }}
+
+      - name: DB integration tests
+        if: inputs.has_postgres && inputs.integration_test_select != ''
+        run: uv run ${{ steps.flags.outputs.with }} pytest ${{ inputs.integration_test_select }} -v --tb=short ${{ steps.flags.outputs.integration_args }} ${{ steps.flags.outputs.no_cov }}
+
+      # The input is passed through env, never interpolated, and every name must be a dotted
+      # Python identifier — a caller cannot smuggle shell through it.
+      - name: Run oracle modules
+        if: inputs.oracle_modules != ''
+        env:
+          ORACLE_MODULES: ${{ inputs.oracle_modules }}
+        run: |
+          set -uo pipefail
+          ran=0; rc=0
+          for mod in $ORACLE_MODULES; do
+            if ! [[ "$mod" =~ ^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$ ]]; then
+              echo "::error::invalid module name '$mod'"; exit 1
+            fi
+            ran=$((ran+1))
+            uv run --no-sync python -m "$mod" || rc=$?
+          done
+          if [ "$ran" -eq 0 ]; then echo "::error::oracle_modules set but no module names parsed"; exit 1; fi
+          exit "$rc"
+
+      - name: Install security tools
+        if: (success() || failure()) && inputs.enable_security_scans && steps.install-deps.outcome == 'success'
+        run: uv pip install "bandit[toml]" pip-audit
+
+      - name: Security scan - bandit
+        if: inputs.enable_security_scans
+        run: |
+          set -euo pipefail
+          if [ -f pyproject.toml ] && grep -qE '^\[tool\.bandit(\]|\.)' pyproject.toml; then
+            echo "::notice::[tool.bandit] present — honouring it via -c pyproject.toml"
+            uv run bandit -c pyproject.toml -r ${{ inputs.src_dir }} -ll -ii -x ./.venv,./tests,./build,./dist,./.git,./node_modules
+          else
+            uv run bandit -r ${{ inputs.src_dir }} -ll -ii -x ./.venv,./tests,./build,./dist,./.git,./node_modules
+          fi
+
+      - name: Security scan - pip-audit
+        if: (success() || failure()) && inputs.enable_security_scans && steps.install-deps.outcome == 'success'
+        run: |
+          set -euo pipefail
+          rc=0
+          for attempt in 1 2 3; do
+            uv run pip-audit --skip-editable ${{ inputs.pip_audit_ignores }} && exit 0
+            rc=$?
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::pip-audit attempt $attempt failed (rc=$rc); retrying after backoff"
+              sleep $((attempt * 15))
+            fi
+          done
+          exit "$rc"
+
+  # Build on every PR (proving the Dockerfile still builds); push only from main. There is no
+  # deploy job: Flux watches the ghcr package through an ImagePolicy.
+  image:
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.build_timeout_minutes }}
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ inputs.registry_owner }}/${{ inputs.image_name }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Disk headroom
+        working-directory: .
+        run: df -h / /tmp | sed 's/^/  /'
+
+      - name: Build image
+        run: docker build -t "$IMAGE:ci" -f ${{ inputs.dockerfile }} .
+
+      - name: Smoke the built image
+        if: inputs.build_smoke != ''
+        env:
+          IMAGE_REF: ${{ env.IMAGE }}:ci
+        run: ${{ inputs.build_smoke }}
+
+      - name: Log in to ghcr
+        if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+        working-directory: .
+        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push image
+        if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          short="${GITHUB_SHA:0:7}"
+          docker tag "$IMAGE:ci" "$IMAGE:sha-$short"
+          docker tag "$IMAGE:ci" "$IMAGE:latest"
+          docker push "$IMAGE:sha-$short"
+          docker push "$IMAGE:latest"
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:latest")"
+          echo "published $digest"
+          {
+            echo "### image published"
+            echo "- \`$digest\`"
+            echo "- ticks: \`sha-$short\`, \`latest\`"
+          } >> "$GITHUB_STEP_SUMMARY"

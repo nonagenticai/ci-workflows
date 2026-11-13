@@ -1,0 +1,153 @@
+# The public python-library pipeline: gates and a wheel build, no publish.
+#
+# Counterpart of `gitops-production/.github/workflows/python-library.yml`. The private archetype
+# publishes the wheel to the estate's internal package index — a public repo cannot reach it and
+# must not depend on it. Public consumers of a library in this org take it as a git dependency:
+#
+#     [tool.uv.sources]
+#     demo-lib = { git = "https://github.com/nonagenticai/<repo>", rev = "<sha>" }
+#
+# so `uv build` here exists to prove the project still packages, not to ship it anywhere.
+#
+# Same rules as python-service.yml: ubuntu-latest only, zero repo secrets, every job gated on
+# `!github.event.repository.private`.
+---
+name: python-library-public
+
+on:
+  workflow_call:
+    inputs:
+      python_version:
+        type: string
+        default: "3.14"
+      uv_version:
+        type: string
+        default: "0.13.7"
+      src_dir:
+        type: string
+        default: "src"
+      test_dir:
+        type: string
+        default: "tests/"
+      working_directory:
+        type: string
+        default: "."
+      uv_sync_args:
+        type: string
+        default: "--all-extras"
+      extra_apt:
+        type: string
+        default: ""
+      pip_audit_ignores:
+        type: string
+        default: ""
+      enable_security_scans:
+        type: boolean
+        default: true
+      ci_workflows_ref:
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  secret-scan:
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: nonagenticai/ci-workflows
+          ref: ${{ inputs.ci_workflows_ref || 'main' }}
+          path: .ci-workflows
+      - run: bash .ci-workflows/scripts/secret-scan.sh
+
+  no-private-refs:
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: nonagenticai/ci-workflows
+          ref: ${{ inputs.ci_workflows_ref || 'main' }}
+          path: .ci-workflows
+      - run: bash .ci-workflows/scripts/no-private-refs.sh
+
+  checks:
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install extra apt packages
+        if: inputs.extra_apt != ''
+        working-directory: .
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends -o Acquire::ForceIPv4=true ${{ inputs.extra_apt }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          version: ${{ inputs.uv_version }}
+          python-version: ${{ inputs.python_version }}
+          enable-cache: true
+          cache-dependency-glob: "**/uv.lock"
+
+      - name: Lockfile freshness (uv.lock vs pyproject.toml)
+        run: uv lock --check
+
+      - name: Install dependencies
+        id: install-deps
+        run: uv sync ${{ inputs.uv_sync_args }}
+
+      - name: Ruff lint
+        run: uv run ruff check .
+
+      - name: Ruff format check
+        run: uv run ruff format --check --config "extend-exclude=['*.md']" .
+
+      - name: Type check (ty)
+        run: uv run ty check ${{ inputs.src_dir }}
+
+      - name: Run tests
+        run: uv run pytest ${{ inputs.test_dir }} -v --tb=short
+
+      - name: Build wheel and sdist
+        run: uv build
+
+      - name: Install security tools
+        if: (success() || failure()) && inputs.enable_security_scans && steps.install-deps.outcome == 'success'
+        run: uv pip install "bandit[toml]" pip-audit
+
+      - name: Security scan - bandit
+        if: inputs.enable_security_scans
+        run: |
+          set -euo pipefail
+          if [ -f pyproject.toml ] && grep -qE '^\[tool\.bandit(\]|\.)' pyproject.toml; then
+            uv run bandit -c pyproject.toml -r ${{ inputs.src_dir }} -ll -ii -x ./.venv,./tests,./build,./dist,./.git,./node_modules
+          else
+            uv run bandit -r ${{ inputs.src_dir }} -ll -ii -x ./.venv,./tests,./build,./dist,./.git,./node_modules
+          fi
+
+      - name: Security scan - pip-audit
+        if: (success() || failure()) && inputs.enable_security_scans && steps.install-deps.outcome == 'success'
+        run: |
+          set -euo pipefail
+          rc=0
+          for attempt in 1 2 3; do
+            uv run pip-audit --skip-editable ${{ inputs.pip_audit_ignores }} && exit 0
+            rc=$?
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::pip-audit attempt $attempt failed (rc=$rc); retrying after backoff"
+              sleep $((attempt * 15))
+            fi
+          done
+          exit "$rc"

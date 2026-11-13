@@ -1,0 +1,48 @@
+name: selftest
+
+# Proves every reusable workflow in this repository against the fixtures beside it, BEFORE any
+# consumer repository is touched. This is the acceptance gate for the archetype itself: if the
+# selftest is red, no consumer may be flipped to it.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  service:
+    uses: ./.github/workflows/python-service.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      image_name: ci-workflows-selftest
+      working_directory: fixtures/python-app
+      src_dir: src
+      has_postgres: true
+      has_redis: true
+      alembic: false
+      ci_workflows_ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      build_smoke: |
+        set -euo pipefail
+        docker run -d --name selftest-app -p 18080:8080 "$IMAGE_REF"
+        ok=0
+        for i in $(seq 1 30); do
+          if curl -sf http://127.0.0.1:18080/health >/dev/null 2>&1; then
+            echo "health ok (attempt $i)"; ok=1; break
+          fi
+          sleep 1
+        done
+        docker logs selftest-app || true
+        docker rm -f selftest-app || true
+        [ "$ok" -eq 1 ]
+
+  library:
+    uses: ./.github/workflows/python-library.yml
+    with:
+      working_directory: fixtures/python-lib
+      src_dir: src
+      ci_workflows_ref: ${{ github.event.pull_request.head.sha || github.sha }}
