@@ -25,6 +25,10 @@ jobs:
       has_postgres: true
       has_redis: true
       alembic: false
+      # Proves db_bootstrap_cmd's exports reach the integration pytest process: the fixture
+      # test asserts SELFTEST_BOOTSTRAP, which only this prefix can set.
+      db_bootstrap_cmd: export SELFTEST_BOOTSTRAP=1
+      integration_test_select: tests/test_bootstrap_env.py -m integration
       ci_workflows_ref: ${{ github.event.pull_request.head.sha || github.sha }}
       build_smoke: |
         set -euo pipefail
