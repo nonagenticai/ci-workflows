@@ -11,6 +11,8 @@ name: image-only-public
 #
 # Publish rules, all on GitHub-hosted runners:
 #   * push to main        -> :sha-<7> + :latest, digest printed for the gitops pin
+#   * workflow_dispatch / schedule on main -> the same (a caller's weekly re-bake must move the
+#                            tag; a schedule only ever fires on the default branch)
 #   * PR from this repo   -> :pr-<7> pushed after a smoke, so a LATER job can consume the image
 #                            by digest-less tag (the runtime-rust image is FROM the runtime one)
 #   * PR from a fork      -> build + smoke only, nothing pushed
@@ -134,9 +136,11 @@ jobs:
       # (measured 2026-11-13). This is a cache-hit rebuild ONLY because it re-passes the same
       # build args from Prepare build args — drop them and the cache key changes, so the pushed
       # image is rebuilt from the Dockerfile default instead of the layer that was smoked.
+      # `schedule` publishes too: a weekly re-bake exists to move the tag, and a scheduled run
+      # is always on the default branch, so the ref guard still holds.
       - name: Publish (main)
         id: publish
-        if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+        if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && github.ref == 'refs/heads/main'
         run: |
           set -euo pipefail
           short="${GITHUB_SHA:0:7}"
