@@ -1,0 +1,151 @@
+name: image-only-public
+
+# Build ONE container image from a repo's own Dockerfile, and publish it to
+# ghcr.io/<registry_owner>/<image_name> from main. No repository secrets, no deploy job: Flux
+# watches the ghcr package through an ImagePolicy.
+#
+# This exists for images that are NOT the repo's Python service — a runtime image built from a
+# bespoke Dockerfile (e.g. coding-containers' codegraph-runtime and codegraph-runtime-rust) — so
+# such a repo does not carry its own hand-rolled workflow. It is deliberately single-image:
+# a second image is a second caller job, not an input.
+#
+# Publish rules, all on GitHub-hosted runners:
+#   * push to main        -> :sha-<7> + :latest, digest printed for the gitops pin
+#   * PR from this repo   -> :pr-<7> pushed after a smoke, so a LATER job can consume the image
+#                            by digest-less tag (the runtime-rust image is FROM the runtime one)
+#   * PR from a fork      -> build + smoke only, nothing pushed
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: "Image name under ghcr.io/<registry_owner>/."
+        required: true
+        type: string
+      registry_owner:
+        description: "ghcr namespace."
+        type: string
+        default: nonagenticai
+      working_directory:
+        description: "Directory containing the project (build context and the Dockerfile's root)."
+        type: string
+        default: "."
+      dockerfile:
+        description: "Dockerfile path, relative to working_directory."
+        type: string
+        default: "Dockerfile"
+      build_args:
+        description: "Newline-separated KEY=VALUE build args."
+        type: string
+        default: ""
+      build_smoke:
+        description: "Shell run against the built image with $IMAGE_REF set. Empty = skip."
+        type: string
+        default: ""
+      build_timeout_minutes:
+        description: "Job cap. A cancelled build reports as *pending*, not red — keep headroom."
+        type: number
+        default: 60
+      ci_workflows_ref:
+        description: >
+          Ref of THIS repository to check out in the caller's tree (the selftest passes the PR
+          head so the fixture always carries the code under test). Empty = the caller's own ref.
+        type: string
+        default: ""
+    outputs:
+      image_ref:
+        description: >
+          Ref a LATER job can pull: :sha-<7> on main, :pr-<7> for a same-repo PR. Empty when
+          nothing was pushed (fork PR) — gate consumers off in that case.
+        value: ${{ jobs.image.outputs.image_ref }}
+      image_digest:
+        description: "Published digest (sha256:...). Empty when nothing was pushed."
+        value: ${{ jobs.image.outputs.image_digest }}
+
+jobs:
+  image:
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.build_timeout_minutes }}
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ inputs.registry_owner }}/${{ inputs.image_name }}
+    outputs:
+      image_ref: ${{ steps.publish.outputs.image_ref || steps.publish_pr.outputs.image_ref }}
+      image_digest: ${{ steps.publish.outputs.image_digest }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ci_workflows_ref || '' }}
+
+      - name: Disk headroom
+        working-directory: .
+        run: df -h / | sed 's/^/  /'
+
+      # A private-at-first ghcr package is still readable by the token of the repo that
+      # published it, so the second job of a two-image chain can pull the first one's tag.
+      - name: Log in to ghcr
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        working-directory: .
+        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build image
+        run: |
+          set -euo pipefail
+          args=()
+          while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            args+=(--build-arg "$line")
+          done <<< "${{ inputs.build_args }}"
+          docker build -t "$IMAGE:ci" -f "${{ inputs.dockerfile }}" "${args[@]}" .
+
+      - name: Smoke the built image
+        if: inputs.build_smoke != ''
+        env:
+          IMAGE_REF: ${{ env.IMAGE }}:ci
+        run: ${{ inputs.build_smoke }}
+
+      # buildx --push, not `docker tag` + `docker push`: on the runner's Docker 29 containerd
+      # image store the classic push path dies with "unknown blob" after the first layer
+      # (measured 2026-11-13). buildx re-uses the build cache, so this is a cache-hit rebuild.
+      - name: Publish (main)
+        id: publish
+        if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          short="${GITHUB_SHA:0:7}"
+          docker buildx build \
+            --push \
+            --tag "$IMAGE:sha-$short" \
+            --tag "$IMAGE:latest" \
+            --file "${{ inputs.dockerfile }}" \
+            --metadata-file "$RUNNER_TEMP/meta.json" \
+            .
+          digest="$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/meta.json")"
+          echo "published $IMAGE@$digest"
+          echo "image_ref=$IMAGE:sha-$short" >> "$GITHUB_OUTPUT"
+          echo "image_digest=$digest" >> "$GITHUB_OUTPUT"
+          {
+            echo "### image published"
+            echo "- \`$IMAGE@$digest\`"
+            echo "- tags: \`sha-$short\`, \`latest\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish PR tag (same-repo PR)
+        id: publish_pr
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        run: |
+          set -euo pipefail
+          short="${GITHUB_SHA:0:7}"
+          docker buildx build \
+            --push \
+            --tag "$IMAGE:pr-$short" \
+            --file "${{ inputs.dockerfile }}" \
+            --metadata-file "$RUNNER_TEMP/meta-pr.json" \
+            .
+          echo "image_ref=$IMAGE:pr-$short" >> "$GITHUB_OUTPUT"
+          echo "published $IMAGE:pr-$short (PR tag, not latest)"
