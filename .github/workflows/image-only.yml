@@ -11,6 +11,8 @@ name: image-only-public
 #
 # Publish rules, all on GitHub-hosted runners:
 #   * push to main        -> :sha-<7> + :latest, digest printed for the gitops pin
+#   * workflow_dispatch / schedule on main -> the same (a caller's weekly re-bake must move the
+#                            tag; a schedule only ever fires on the default branch)
 #   * PR from this repo   -> :pr-<7> pushed after a smoke, so a LATER job can consume the image
 #                            by digest-less tag (the runtime-rust image is FROM the runtime one)
 #   * PR from a fork      -> build + smoke only, nothing pushed
@@ -93,14 +95,34 @@ jobs:
         working-directory: .
         run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
+      # Build args are materialised ONCE, as a file, and re-read by every build below.
+      #
+      # WHY A FILE: the publish steps are separate buildx invocations, and BuildKit folds every
+      # ARG value an instruction references into its cache key. If the push did not re-pass the
+      # same args it would MISS that cache and rebuild from the Dockerfile DEFAULT — pushing an
+      # image nobody smoked (a caller chaining `BASE_IMAGE=${{ needs.x.outputs.image_ref }}`
+      # would ship the wrong base). The value travels via env, never interpolated into the
+      # script text, so a multi-line or quoted ARG cannot turn into shell.
+      - name: Prepare build args
+        env:
+          BUILD_ARGS: ${{ inputs.build_args }}
+        run: |
+          set -euo pipefail
+          args_file="$RUNNER_TEMP/build-args.txt"
+          : > "$args_file"
+          while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            printf '%s\n' "$line" >> "$args_file"
+          done <<< "$BUILD_ARGS"
+          echo "build args: $(wc -l < "$args_file" | tr -d ' ')"
+
       - name: Build image
         run: |
           set -euo pipefail
           args=()
           while IFS= read -r line; do
-            [ -n "$line" ] || continue
             args+=(--build-arg "$line")
-          done <<< "${{ inputs.build_args }}"
+          done < "$RUNNER_TEMP/build-args.txt"
           docker build -t "$IMAGE:ci" -f "${{ inputs.dockerfile }}" "${args[@]}" .
 
       - name: Smoke the built image
@@ -111,19 +133,28 @@ jobs:
 
       # buildx --push, not `docker tag` + `docker push`: on the runner's Docker 29 containerd
       # image store the classic push path dies with "unknown blob" after the first layer
-      # (measured 2026-11-13). buildx re-uses the build cache, so this is a cache-hit rebuild.
+      # (measured 2026-11-13). This is a cache-hit rebuild ONLY because it re-passes the same
+      # build args from Prepare build args — drop them and the cache key changes, so the pushed
+      # image is rebuilt from the Dockerfile default instead of the layer that was smoked.
+      # `schedule` publishes too: a weekly re-bake exists to move the tag, and a scheduled run
+      # is always on the default branch, so the ref guard still holds.
       - name: Publish (main)
         id: publish
-        if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+        if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && github.ref == 'refs/heads/main'
         run: |
           set -euo pipefail
           short="${GITHUB_SHA:0:7}"
+          args=()
+          while IFS= read -r line; do
+            args+=(--build-arg "$line")
+          done < "$RUNNER_TEMP/build-args.txt"
           docker buildx build \
             --push \
             --tag "$IMAGE:sha-$short" \
             --tag "$IMAGE:latest" \
             --file "${{ inputs.dockerfile }}" \
             --metadata-file "$RUNNER_TEMP/meta.json" \
+            "${args[@]}" \
             .
           digest="$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/meta.json")"
           echo "published $IMAGE@$digest"
@@ -141,11 +172,16 @@ jobs:
         run: |
           set -euo pipefail
           short="${GITHUB_SHA:0:7}"
+          args=()
+          while IFS= read -r line; do
+            args+=(--build-arg "$line")
+          done < "$RUNNER_TEMP/build-args.txt"
           docker buildx build \
             --push \
             --tag "$IMAGE:pr-$short" \
             --file "${{ inputs.dockerfile }}" \
             --metadata-file "$RUNNER_TEMP/meta-pr.json" \
+            "${args[@]}" \
             .
           echo "image_ref=$IMAGE:pr-$short" >> "$GITHUB_OUTPUT"
           echo "published $IMAGE:pr-$short (PR tag, not latest)"

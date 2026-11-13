@@ -59,12 +59,39 @@ jobs:
     with:
       image_name: ci-workflows-image-selftest
       working_directory: fixtures/image-only
-      # The fixture turns the build arg into ENV; the smoke reads it back from the running
-      # container, so a dropped --build-arg cannot pass.
+      # The fixture turns the build arg into ENV and the smoke reads it back from $IMAGE:ci —
+      # that covers the LOCAL build only. `imageonly-published` below proves the pushed image.
       build_args: GREETING=hi
       ci_workflows_ref: ${{ github.event.pull_request.head.sha || github.sha }}
       build_smoke: |
         set -euo pipefail
         docker run --rm "$IMAGE_REF" sh -c 'test "$GREETING" = hi'
         echo "build arg reached the image"
+
+  imageonly-published:
+    # Acceptance gate for the ARG-PLUMBING DEFECT fixed 2026-11-13: the publish steps used to
+    # invoke buildx without --build-arg, so the pushed image was rebuilt from the Dockerfile
+    # DEFAULT. The `imageonly` smoke could not see it (it only ever ran against $IMAGE:ci).
+    #
+    # This job pulls the tag the reusable workflow ACTUALLY PUBLISHED — `pr-<7>` on a same-repo
+    # PR, `sha-<7>` on main — and reads the arg back. RED if the publish drops the args
+    # (GREETING would be `hello`, the fixture default), GREEN with the fix. Fork PRs push
+    # nothing, so image_ref is empty and the job is skipped.
+    needs: imageonly
+    if: needs.imageonly.outputs.image_ref != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Log in to ghcr
+        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Read the build arg back from the PUBLISHED image
+        env:
+          IMAGE_REF: ${{ needs.imageonly.outputs.image_ref }}
+        run: |
+          set -euo pipefail
+          docker run --rm "$IMAGE_REF" sh -c 'test "$GREETING" = hi'
+          echo "published $IMAGE_REF still carries GREETING=hi"
 
