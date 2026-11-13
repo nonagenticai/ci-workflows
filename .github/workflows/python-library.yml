@@ -9,6 +9,13 @@
 #
 # so `uv build` here exists to prove the project still packages, not to ship it anywhere.
 #
+# ⛔ Do NOT add a PyPI publish job to this reusable workflow. PyPI refuses a reusable workflow as a
+# Trusted Publisher — "Reusable workflows cannot currently be used as the workflow in a Trusted
+# Publisher" (pypi/warehouse#11096) — so an upload job here cannot use OIDC and would need a
+# long-lived token secret. A repo that publishes to PyPI carries its own
+# `.github/workflows/publish.yml` with `id-token: write` and environment `pypi`, and keeps its
+# gates here. Reference: nonagenticai/coding-client `.github/workflows/publish.yml`.
+#
 # Same rules as python-service.yml: ubuntu-latest only, zero repo secrets, every job gated on
 # `!github.event.repository.private`.
 ---
