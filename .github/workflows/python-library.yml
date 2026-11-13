@@ -122,7 +122,12 @@ jobs:
         run: uv run ruff format --check --config "extend-exclude=['*.md']" .
 
       - name: Type check (ty)
-        run: uv run ty check ${{ inputs.src_dir }}
+        # PINNED deliberately: ty is a CI TOOL, not a library, so its version belongs to the
+        # archetype rather than to each consumer's dependency graph. Unpinned (`uv run ty`) made
+        # Dependabot raise the same bump in 8 repos at once, and ty 0.0.100 turned 14 PRs red on
+        # diagnostics (`incompatible-mutable-override`, `missing-union-attribute`) that are real
+        # but not worth chasing in Python we are exiting. Move this pin, never the consumers.
+        run: uvx ty@0.0.39 check ${{ inputs.src_dir }}
 
       - name: Run tests
         run: uv run pytest ${{ inputs.test_dir }} -v --tb=short
