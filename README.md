@@ -1,5 +1,9 @@
 # ci-workflows
 
+[![CI](https://github.com/nonagenticai/ci-workflows/actions/workflows/selftest.yml/badge.svg)](https://github.com/nonagenticai/ci-workflows/actions/workflows/selftest.yml)
+[![Release](https://img.shields.io/github/v/release/nonagenticai/ci-workflows)](https://github.com/nonagenticai/ci-workflows/releases)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 Public reusable GitHub Actions workflows for `nonagenticai` **public** repositories.
 
 ## Why this repository exists
@@ -98,3 +102,19 @@ coding-client = { git = "https://github.com/nonagenticai/coding-client", rev = "
   `gitops-production/.betterleaks.toml`. If you change one, change both.
 - Consumers pin `@main`. A change here reaches every consumer on its next run — the selftest is
   what makes that safe.
+
+## Security
+
+Report vulnerabilities privately through the repository's Security tab — see
+[`SECURITY.md`](SECURITY.md). Do not open a public issue for a security problem.
+
+## Contributing
+
+Issues and pull requests are welcome. See
+[`CONTRIBUTING.md`](https://github.com/nonagenticai/.github/blob/main/CONTRIBUTING.md) for the
+organisation-wide rules; setup, test and lint commands are in this README. Commits carry DCO
+sign-off.
+
+## License
+
+Apache-2.0 — see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
