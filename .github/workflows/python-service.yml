@@ -80,7 +80,10 @@ on:
         type: boolean
         default: false
       db_bootstrap_cmd:
-        description: "Shell command run (from working_directory) once the database is up."
+        description: |
+          Shell command run (from working_directory) in the SAME shell as the DB-integration
+          pytest, immediately before it — so anything it exports is visible to the tests.
+          Only runs when integration_test_select is set. Empty = skip.
         type: string
         default: ""
       integration_test_select:
@@ -289,10 +292,6 @@ jobs:
         if: inputs.alembic
         run: uv run alembic upgrade head
 
-      - name: Bootstrap CI database
-        if: inputs.has_postgres && inputs.db_bootstrap_cmd != ''
-        run: ${{ inputs.db_bootstrap_cmd }}
-
       - name: Ruff lint
         run: uv run ruff check .
 
@@ -333,9 +332,21 @@ jobs:
           REDIS_PORT: 6379
         run: uv run ${{ steps.flags.outputs.with }} pytest ${{ inputs.test_dir }} -v --tb=short ${{ steps.flags.outputs.unit_args }} ${{ steps.flags.outputs.no_cov }}
 
+      # ⛔ The bootstrap runs HERE, in the same shell as the pytest it precedes — never in a
+      # step of its own. A caller's bootstrap usually *exports* something the tests read
+      # (`db_bootstrap_cmd: export TEST_DATABASE_URL=$DATABASE_URL`); an export in a previous
+      # step dies with that step's shell, so the tests run without it. Measured on
+      # coding-analysis, run 43414596003: the private archetype runs this prefix inline, the
+      # public one had split it out, and the integration pass failed on the missing DSN.
       - name: DB integration tests
         if: inputs.has_postgres && inputs.integration_test_select != ''
-        run: uv run ${{ steps.flags.outputs.with }} pytest ${{ inputs.integration_test_select }} -v --tb=short ${{ steps.flags.outputs.integration_args }} ${{ steps.flags.outputs.no_cov }}
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.db_bootstrap_cmd }}" ]; then
+            echo "Bootstrapping CI DB: ${{ inputs.db_bootstrap_cmd }}"
+            ${{ inputs.db_bootstrap_cmd }}
+          fi
+          uv run ${{ steps.flags.outputs.with }} pytest ${{ inputs.integration_test_select }} -v --tb=short ${{ steps.flags.outputs.integration_args }} ${{ steps.flags.outputs.no_cov }}
 
       # The input is passed through env, never interpolated, and every name must be a dotted
       # Python identifier — a caller cannot smuggle shell through it.
