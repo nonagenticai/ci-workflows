@@ -215,15 +215,20 @@ jobs:
           # Disk-backed named volume, NOT a --tmpfs: conveyor measured the RAM-capped tmpfs
           # running out after ~1000 test databases (md.c, "No space left on device").
           # --shm-size=1g: the 64 MB default breaks Postgres parallel workers (dsm_impl.c).
+          # ⚠️ Mount at /var/lib/postgresql, NOT /var/lib/postgresql/data: the postgres:18
+          # image moved PGDATA into a version subdirectory and REFUSES to start on the old
+          # mount point (measured 2026-11-13 — the container exits 1 and --rm erases it).
           docker volume create cipg >/dev/null
-          docker run --rm -d --name cipg \
+          if ! out="$(docker run -d --name cipg \
             -p 127.0.0.1:5432:5432 \
             --shm-size=1g \
             -e POSTGRES_USER=ci_test -e POSTGRES_PASSWORD=ci_test -e POSTGRES_DB="$DB" \
-            -v cipg:/var/lib/postgresql/data \
+            -v cipg:/var/lib/postgresql \
             pgvector/pgvector:pg18 \
             -c fsync=off -c max_connections=300 \
-            -c checkpoint_timeout=30s -c max_wal_size=256MB >/dev/null
+            -c checkpoint_timeout=30s -c max_wal_size=256MB 2>&1)"; then
+            echo "::error::docker run failed for the CI database"; echo "$out"; exit 1
+          fi
           for i in $(seq 1 90); do
             if docker exec cipg pg_isready -U ci_test -d "$DB" >/dev/null 2>&1; then
               echo "postgres ready (attempt $i)"; break
