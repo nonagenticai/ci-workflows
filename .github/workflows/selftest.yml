@@ -121,6 +121,7 @@ jobs:
     with:
       image_name: ci-workflows-go-selftest
       working_directory: fixtures/go-app/src
+      dockerfile: fixtures/go-app/src/Dockerfile
       ci_workflows_ref: ${{ github.event.pull_request.head.sha || github.sha }}
       build_smoke: |
         set -euo pipefail

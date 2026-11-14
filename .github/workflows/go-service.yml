@@ -29,7 +29,9 @@ on:
         type: string
         default: "1.26"
       dockerfile:
-        description: "Dockerfile path, relative to working_directory."
+        description: >
+          Dockerfile path, relative to the REPOSITORY ROOT (a Go service keeps its Dockerfile at
+          the root and its module in src/, so it cannot be working_directory-relative).
         type: string
         default: "Dockerfile"
       build_smoke:
@@ -179,8 +181,7 @@ jobs:
       - name: Build image
         env:
           DOCKERFILE: ${{ inputs.dockerfile }}
-          CONTEXT: ${{ inputs.working_directory }}
-        run: docker build -t "$IMAGE:ci" -f "$CONTEXT/$DOCKERFILE" .
+        run: docker build -t "$IMAGE:ci" -f "$DOCKERFILE" .
 
       - name: Smoke the built image
         if: inputs.build_smoke != ''
@@ -194,7 +195,6 @@ jobs:
         if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && github.ref == 'refs/heads/main'
         env:
           DOCKERFILE: ${{ inputs.dockerfile }}
-          CONTEXT: ${{ inputs.working_directory }}
         run: |
           set -euo pipefail
           short="${GITHUB_SHA:0:7}"
@@ -203,7 +203,7 @@ jobs:
             --provenance=mode=max \
             --tag "$IMAGE:sha-$short" \
             --tag "$IMAGE:latest" \
-            --file "$CONTEXT/$DOCKERFILE" \
+            --file "$DOCKERFILE" \
             --metadata-file "$RUNNER_TEMP/meta.json" \
             .
           digest="$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/meta.json")"
@@ -216,7 +216,6 @@ jobs:
         if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
         env:
           DOCKERFILE: ${{ inputs.dockerfile }}
-          CONTEXT: ${{ inputs.working_directory }}
         run: |
           set -euo pipefail
           short="${GITHUB_SHA:0:7}"
@@ -224,7 +223,7 @@ jobs:
             --push \
             --provenance=mode=max \
             --tag "$IMAGE:pr-$short" \
-            --file "$CONTEXT/$DOCKERFILE" \
+            --file "$DOCKERFILE" \
             --metadata-file "$RUNNER_TEMP/meta-pr.json" \
             .
           echo "image_ref=$IMAGE:pr-$short" >> "$GITHUB_OUTPUT"
