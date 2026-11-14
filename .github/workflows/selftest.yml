@@ -13,6 +13,41 @@ permissions:
   contents: read
 
 jobs:
+  # The static gate for the trust root. Every consumer runs this repository's `main` with
+  # `packages: write`, so a defect here is a defect in ten repositories at once: actionlint
+  # catches malformed workflow/expression syntax, zizmor catches the security-relevant patterns
+  # (template injection into `run:`, unpinned actions, over-broad permissions, persisted
+  # credentials). Both are pinned — the lint of a trust root must not itself float.
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: actionlint (pinned release tarball, checksum verified)
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL --retry 3 --max-time 60 "$url" -o "$tmp/actionlint.tar.gz"
+          echo "${ACTIONLINT_SHA256}  $tmp/actionlint.tar.gz" | sha256sum -c -
+          tar -xzf "$tmp/actionlint.tar.gz" -C "$tmp" actionlint
+          "$tmp/actionlint" -color
+
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: false
+
+      - name: zizmor (pinned, auditor persona, gates medium and above)
+        run: uvx zizmor==1.32.0 --persona=auditor --min-severity=medium --format=plain .
+
   service:
     uses: ./.github/workflows/python-service.yml
     permissions:
@@ -85,7 +120,10 @@ jobs:
       packages: read
     steps:
       - name: Log in to ghcr
-        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
 
       - name: Read the build arg back from the PUBLISHED image
         env:

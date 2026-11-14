@@ -103,6 +103,28 @@ coding-client = { git = "https://github.com/nonagenticai/coding-client", rev = "
 - Consumers pin `@main`. A change here reaches every consumer on its next run — the selftest is
   what makes that safe.
 
+## Trust model (this repository is a supply chain)
+
+Every consumer runs `python-service.yml@main` (or `python-library.yml@main`) with
+`packages: write`. **A commit merged here executes in all ten consumer repositories on their next
+run**, and the images it pushes are what Flux deploys. That is the price of "fix once, apply
+everywhere", and these are the controls that carry it:
+
+| control | where |
+|---|---|
+| every third-party action is pinned to a **commit SHA** with a `# vX.Y.Z` comment | all workflows; Dependabot updates the SHA and the comment |
+| `cooldown: default-days: 7` on Dependabot — a yanked release never reaches us | `.github/dependabot.yml` |
+| **`lint` job**: actionlint + zizmor (auditor persona, gates medium and above) on every PR | `selftest.yml`, a required check |
+| template values reach `run:` through `env:`, never interpolated into the script text | every step that takes an input |
+| `permissions: contents: read` at workflow level; `packages: write` only on the image job | all workflows |
+| `persist-credentials: false` on every checkout — no token left in `.git/config` | all workflows |
+| pushed images carry a SLSA provenance attestation (`--provenance=mode=max`) | the publish steps |
+| CODEOWNERS, non-fast-forward, PR required, secret scanning + push protection | repository settings |
+
+**Residual risk, stated plainly:** merges here are self-approved (a single-owner org cannot review
+its own PRs), so the branch ruleset and the `lint` gate are the only pre-merge controls. Treat
+write access to this repository as equivalent to write access to all ten consumers.
+
 ## Security
 
 Report vulnerabilities privately through the repository's Security tab — see

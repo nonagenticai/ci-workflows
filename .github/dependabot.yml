@@ -4,6 +4,10 @@ updates:
     directory: /
     schedule: { interval: weekly, day: monday }
     open-pull-requests-limit: 5
+    # Supply-chain control (zizmor dependabot-cooldown): a compromised action release is
+    # usually yanked within days. Security updates are exempt from cooldown by design.
+    cooldown:
+      default-days: 7
     groups:
       github-actions:
         patterns: ["*"]

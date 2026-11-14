@@ -63,6 +63,11 @@ on:
         description: "Published digest (sha256:...). Empty when nothing was pushed."
         value: ${{ jobs.image.outputs.image_digest }}
 
+# Least privilege by default; only the `image` job widens to packages: write, and only it
+# needs it (the push). The two scan jobs read the tree and nothing else.
+permissions:
+  contents: read
+
 jobs:
   # A public repo's own tree still has to be publishable: an image-only repo carries source,
   # fixtures and docs even when the build is a Dockerfile. Same two gates the python archetypes
@@ -72,12 +77,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: nonagenticai/ci-workflows
           ref: ${{ inputs.ci_workflows_ref || 'main' }}
           path: .ci-workflows
+          persist-credentials: false
       - name: Scan the tree
         run: bash .ci-workflows/scripts/secret-scan.sh
 
@@ -86,12 +94,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: nonagenticai/ci-workflows
           ref: ${{ inputs.ci_workflows_ref || 'main' }}
           path: .ci-workflows
+          persist-credentials: false
       - name: Scan tracked files
         run: bash .ci-workflows/scripts/no-private-refs.sh
 
@@ -111,9 +122,10 @@ jobs:
       run:
         working-directory: ${{ inputs.working_directory }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ inputs.ci_workflows_ref || '' }}
+          persist-credentials: false
 
       - name: Disk headroom
         working-directory: .
@@ -124,7 +136,10 @@ jobs:
       - name: Log in to ghcr
         if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         working-directory: .
-        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
 
       # Build args are materialised ONCE, as a file, and re-read by every build below.
       #
@@ -148,19 +163,22 @@ jobs:
           echo "build args: $(wc -l < "$args_file" | tr -d ' ')"
 
       - name: Build image
+        env:
+          DOCKERFILE: ${{ inputs.dockerfile }}
         run: |
           set -euo pipefail
           args=()
           while IFS= read -r line; do
             args+=(--build-arg "$line")
           done < "$RUNNER_TEMP/build-args.txt"
-          docker build -t "$IMAGE:ci" -f "${{ inputs.dockerfile }}" "${args[@]}" .
+          docker build -t "$IMAGE:ci" -f "$DOCKERFILE" "${args[@]}" .
 
       - name: Smoke the built image
         if: inputs.build_smoke != ''
         env:
           IMAGE_REF: ${{ env.IMAGE }}:ci
-        run: ${{ inputs.build_smoke }}
+          BUILD_SMOKE: ${{ inputs.build_smoke }}
+        run: bash -c "$BUILD_SMOKE"
 
       # buildx --push, not `docker tag` + `docker push`: on the runner's Docker 29 containerd
       # image store the classic push path dies with "unknown blob" after the first layer
@@ -172,6 +190,8 @@ jobs:
       - name: Publish (main)
         id: publish
         if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && github.ref == 'refs/heads/main'
+        env:
+          DOCKERFILE: ${{ inputs.dockerfile }}
         run: |
           set -euo pipefail
           short="${GITHUB_SHA:0:7}"
@@ -179,11 +199,15 @@ jobs:
           while IFS= read -r line; do
             args+=(--build-arg "$line")
           done < "$RUNNER_TEMP/build-args.txt"
+          # --provenance=mode=max: the pushed manifest carries a SLSA build provenance
+          # attestation naming this repo, this commit and this workflow. It costs one flag and
+          # is the only thing that lets a puller verify what produced the image.
           docker buildx build \
             --push \
+            --provenance=mode=max \
             --tag "$IMAGE:sha-$short" \
             --tag "$IMAGE:latest" \
-            --file "${{ inputs.dockerfile }}" \
+            --file "$DOCKERFILE" \
             --metadata-file "$RUNNER_TEMP/meta.json" \
             "${args[@]}" \
             .
@@ -200,6 +224,8 @@ jobs:
       - name: Publish PR tag (same-repo PR)
         id: publish_pr
         if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          DOCKERFILE: ${{ inputs.dockerfile }}
         run: |
           set -euo pipefail
           short="${GITHUB_SHA:0:7}"
@@ -207,10 +233,13 @@ jobs:
           while IFS= read -r line; do
             args+=(--build-arg "$line")
           done < "$RUNNER_TEMP/build-args.txt"
+          # Same provenance flag as the main publish: this is the PR path, so the selftest
+          # proves the flag works on a hosted runner BEFORE it reaches main.
           docker buildx build \
             --push \
+            --provenance=mode=max \
             --tag "$IMAGE:pr-$short" \
-            --file "${{ inputs.dockerfile }}" \
+            --file "$DOCKERFILE" \
             --metadata-file "$RUNNER_TEMP/meta-pr.json" \
             "${args[@]}" \
             .

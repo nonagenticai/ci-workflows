@@ -64,12 +64,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: nonagenticai/ci-workflows
           ref: ${{ inputs.ci_workflows_ref || 'main' }}
           path: .ci-workflows
+          persist-credentials: false
       - run: bash .ci-workflows/scripts/secret-scan.sh
 
   no-private-refs:
@@ -77,12 +80,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: nonagenticai/ci-workflows
           ref: ${{ inputs.ci_workflows_ref || 'main' }}
           path: .ci-workflows
+          persist-credentials: false
       - run: bash .ci-workflows/scripts/no-private-refs.sh
 
   checks:
@@ -93,15 +99,22 @@ jobs:
       run:
         working-directory: ${{ inputs.working_directory }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Install extra apt packages
         if: inputs.extra_apt != ''
         working-directory: .
-        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends -o Acquire::ForceIPv4=true ${{ inputs.extra_apt }}
+        env:
+          EXTRA_APT: ${{ inputs.extra_apt }}
+        run: |
+          set -euo pipefail
+          read -r -a apt <<< "$EXTRA_APT"
+          sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends -o Acquire::ForceIPv4=true "${apt[@]}"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
           version: ${{ inputs.uv_version }}
           python-version: ${{ inputs.python_version }}
@@ -113,7 +126,14 @@ jobs:
 
       - name: Install dependencies
         id: install-deps
-        run: uv sync ${{ inputs.uv_sync_args }}
+        env:
+          UV_SYNC_ARGS: ${{ inputs.uv_sync_args }}
+        run: |
+          set -euo pipefail
+          # The input is a whitespace-separated flag list; read -a splits it WITHOUT globbing,
+          # which an unquoted expansion would also do.
+          read -r -a sync_args <<< "$UV_SYNC_ARGS"
+          uv sync "${sync_args[@]}"
 
       - name: Ruff lint
         run: uv run ruff check .
@@ -127,10 +147,14 @@ jobs:
         # Dependabot raise the same bump in 8 repos at once, and ty 0.0.100 turned 14 PRs red on
         # diagnostics (`incompatible-mutable-override`, `missing-union-attribute`) that are real
         # but not worth chasing in Python we are exiting. Move this pin, never the consumers.
-        run: uvx ty@0.0.39 check ${{ inputs.src_dir }}
+        env:
+          SRC_DIR: ${{ inputs.src_dir }}
+        run: uvx ty@0.0.39 check "$SRC_DIR"
 
       - name: Run tests
-        run: uv run pytest ${{ inputs.test_dir }} -v --tb=short
+        env:
+          TEST_DIR: ${{ inputs.test_dir }}
+        run: uv run pytest "$TEST_DIR" -v --tb=short
 
       - name: Build wheel and sdist
         run: uv build
@@ -141,21 +165,26 @@ jobs:
 
       - name: Security scan - bandit
         if: inputs.enable_security_scans
+        env:
+          SRC_DIR: ${{ inputs.src_dir }}
         run: |
           set -euo pipefail
           if [ -f pyproject.toml ] && grep -qE '^\[tool\.bandit(\]|\.)' pyproject.toml; then
-            uv run bandit -c pyproject.toml -r ${{ inputs.src_dir }} -ll -ii -x ./.venv,./tests,./build,./dist,./.git,./node_modules
+            uv run bandit -c pyproject.toml -r "$SRC_DIR" -ll -ii -x ./.venv,./tests,./build,./dist,./.git,./node_modules
           else
-            uv run bandit -r ${{ inputs.src_dir }} -ll -ii -x ./.venv,./tests,./build,./dist,./.git,./node_modules
+            uv run bandit -r "$SRC_DIR" -ll -ii -x ./.venv,./tests,./build,./dist,./.git,./node_modules
           fi
 
       - name: Security scan - pip-audit
         if: (success() || failure()) && inputs.enable_security_scans && steps.install-deps.outcome == 'success'
+        env:
+          PIP_AUDIT_IGNORES: ${{ inputs.pip_audit_ignores }}
         run: |
           set -euo pipefail
+          read -r -a ignores <<< "$PIP_AUDIT_IGNORES"
           rc=0
           for attempt in 1 2 3; do
-            uv run pip-audit --skip-editable ${{ inputs.pip_audit_ignores }} && exit 0
+            uv run pip-audit --skip-editable "${ignores[@]}" && exit 0
             rc=$?
             if [ "$attempt" -lt 3 ]; then
               echo "::warning::pip-audit attempt $attempt failed (rc=$rc); retrying after backoff"
