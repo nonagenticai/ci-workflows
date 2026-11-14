@@ -83,7 +83,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: nonagenticai/ci-workflows
-          ref: ${{ inputs.ci_workflows_ref || 'main' }}
+          ref: main
           path: .ci-workflows
           persist-credentials: false
       - name: Scan the tree
@@ -100,7 +100,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: nonagenticai/ci-workflows
-          ref: ${{ inputs.ci_workflows_ref || 'main' }}
+          ref: main
           path: .ci-workflows
           persist-credentials: false
       - name: Scan tracked files
