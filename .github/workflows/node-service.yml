@@ -82,10 +82,24 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      # A commit SHA, or main. Never a branch, tag or refs/pull/* ref: the input exists so a
+      # caller can run ITS OWN tree's scripts at a PR head, and a fork PR that could point this
+      # at arbitrary unmerged code would be privilege-escalating into this repository's scripts.
+      - name: Resolve the ci-workflows ref (40-hex commit, else main)
+        id: ci-ref
+        env:
+          REF_INPUT: ${{ inputs.ci_workflows_ref }}
+        run: |
+          set -euo pipefail
+          ref="$REF_INPUT"
+          if ! [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+            ref=main
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: nonagenticai/ci-workflows
-          ref: ${{ inputs.ci_workflows_ref || 'main' }}
+          ref: ${{ steps.ci-ref.outputs.ref }}
           path: .ci-workflows
           persist-credentials: false
       - name: Scan the tree
@@ -99,10 +113,24 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      # A commit SHA, or main. Never a branch, tag or refs/pull/* ref: the input exists so a
+      # caller can run ITS OWN tree's scripts at a PR head, and a fork PR that could point this
+      # at arbitrary unmerged code would be privilege-escalating into this repository's scripts.
+      - name: Resolve the ci-workflows ref (40-hex commit, else main)
+        id: ci-ref
+        env:
+          REF_INPUT: ${{ inputs.ci_workflows_ref }}
+        run: |
+          set -euo pipefail
+          ref="$REF_INPUT"
+          if ! [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+            ref=main
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: nonagenticai/ci-workflows
-          ref: ${{ inputs.ci_workflows_ref || 'main' }}
+          ref: ${{ steps.ci-ref.outputs.ref }}
           path: .ci-workflows
           persist-credentials: false
       - name: Scan tracked files
