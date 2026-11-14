@@ -48,6 +48,23 @@ jobs:
       - name: zizmor (pinned, auditor persona, gates medium and above)
         run: uvx zizmor==1.32.0 --persona=auditor --min-severity=medium --format=plain .
 
+  # The scan jobs in every archetype read this repository's `main` — a caller-supplied ref cannot
+  # be allowed to choose the code those jobs execute. That removes the selftest's old way of
+  # exercising a PR's scripts, so this job runs the PR's OWN scripts against the PR tree. Same
+  # coverage, no untrusted checkout.
+  guard-scripts:
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: secret-scan (this tree)
+        run: bash scripts/secret-scan.sh
+      - name: no-private-refs (this tree)
+        run: bash scripts/no-private-refs.sh
+
   service:
     uses: ./.github/workflows/python-service.yml
     permissions:
@@ -64,7 +81,6 @@ jobs:
       # test asserts SELFTEST_BOOTSTRAP, which only this prefix can set.
       db_bootstrap_cmd: export SELFTEST_BOOTSTRAP=1
       integration_test_select: tests/test_bootstrap_env.py -m integration
-      ci_workflows_ref: ${{ github.event.pull_request.head.sha || github.sha }}
       build_smoke: |
         set -euo pipefail
         docker run -d --name selftest-app -p 18080:8080 "$IMAGE_REF"
@@ -84,7 +100,6 @@ jobs:
     with:
       working_directory: fixtures/python-lib
       src_dir: src
-      ci_workflows_ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
   # Proves node-service.yml end to end: the fixture has no dependencies, so `npm ci` contacts no
   # registry and a red run points at the archetype rather than at npm.

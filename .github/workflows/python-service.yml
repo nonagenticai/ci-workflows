@@ -129,13 +129,6 @@ on:
         description: "Per-test timeout for integration tests."
         type: number
         default: 600
-      ci_workflows_ref:
-        description: |
-          Commit/branch of THIS repository whose scripts/ and fleet betterleaks config are used.
-          Consumers leave it empty (= `main`, the ref they pin in `uses:`); the selftest passes
-          its own sha.
-        type: string
-        default: ""
 
 permissions:
   contents: read
@@ -155,7 +148,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: nonagenticai/ci-workflows
-          ref: ${{ inputs.ci_workflows_ref || 'main' }}
+          ref: main
           path: .ci-workflows
           persist-credentials: false
       - name: Scan the tree
@@ -175,7 +168,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: nonagenticai/ci-workflows
-          ref: ${{ inputs.ci_workflows_ref || 'main' }}
+          ref: main
           path: .ci-workflows
           persist-credentials: false
       - name: Scan tracked files
