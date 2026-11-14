@@ -1,0 +1,16 @@
+{
+  "name": "node-app-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Selftest fixture for node-service.yml. Dependency-free on purpose: no registry is contacted, so a red run means the archetype is wrong, not npm.",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "lint": "node --check index.js && node --check test.js",
+    "test": "node --test",
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

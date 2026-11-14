@@ -86,6 +86,31 @@ jobs:
       src_dir: src
       ci_workflows_ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
+  # Proves node-service.yml end to end: the fixture has no dependencies, so `npm ci` contacts no
+  # registry and a red run points at the archetype rather than at npm.
+  node:
+    uses: ./.github/workflows/node-service.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      image_name: ci-workflows-node-selftest
+      working_directory: fixtures/node-app
+      ci_workflows_ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      build_smoke: |
+        set -euo pipefail
+        docker run -d --name selftest-node -p 18081:8080 "$IMAGE_REF"
+        ok=0
+        for i in $(seq 1 30); do
+          if curl -sf http://127.0.0.1:18081/health >/dev/null 2>&1; then
+            echo "health ok (attempt $i)"; ok=1; break
+          fi
+          sleep 1
+        done
+        docker logs selftest-node || true
+        docker rm -f selftest-node || true
+        [ "$ok" -eq 1 ]
+
   imageonly:
     uses: ./.github/workflows/image-only.yml
     permissions:
