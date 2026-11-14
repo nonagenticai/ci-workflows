@@ -111,6 +111,32 @@ jobs:
         docker rm -f selftest-node || true
         [ "$ok" -eq 1 ]
 
+  # Proves go-service.yml end to end: go mod verify + go vet + go test, then the image build and
+  # a /health smoke against it.
+  go:
+    uses: ./.github/workflows/go-service.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      image_name: ci-workflows-go-selftest
+      working_directory: fixtures/go-app/src
+      dockerfile: fixtures/go-app/src/Dockerfile
+      ci_workflows_ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      build_smoke: |
+        set -euo pipefail
+        docker run -d --name selftest-go -p 18082:8080 "$IMAGE_REF"
+        ok=0
+        for i in $(seq 1 30); do
+          if curl -sf http://127.0.0.1:18082/health >/dev/null 2>&1; then
+            echo "health ok (attempt $i)"; ok=1; break
+          fi
+          sleep 1
+        done
+        docker logs selftest-go || true
+        docker rm -f selftest-go || true
+        [ "$ok" -eq 1 ]
+
   imageonly:
     uses: ./.github/workflows/image-only.yml
     permissions:
