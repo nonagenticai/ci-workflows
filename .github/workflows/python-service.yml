@@ -328,7 +328,7 @@ jobs:
         # but not worth chasing in Python we are exiting. Move this pin, never the consumers.
         env:
           SRC_DIR: ${{ inputs.src_dir }}
-        run: uvx ty@0.0.39 check "$SRC_DIR"
+        run: uvx ty@0.0.104 check "$SRC_DIR"
 
       # Mirrors the archetype: use the project's own pytest-timeout when it has one, otherwise
       # inject one so a hung test cannot burn the whole job budget.
