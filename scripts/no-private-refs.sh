@@ -22,13 +22,34 @@ set -uo pipefail
 cd "$(git rev-parse --show-toplevel)" || exit 2
 
 # Hard failures. No \b: BSD/macOS regcomp has no word boundary, and this must behave the same on
-# the dev box and on the runner.
+# the dev box and on the runner. The trailing-boundary groups below are hand-rolled stand-ins for
+# \b, for that reason.
 HARD=(
-  '\.internal'
+  # Needs a boundary AFTER the word, not before. A bare `\.internal` matched the Python function
+  # name `main.internal_mint_tenant_bundle_token` on four lines of `licenses` migrations, and a
+  # Rust test helper `c.internal(…)` on 107 lines of `agent` — a false positive on the very repos
+  # this guard exists to clear. A hostname is always followed by a delimiter (port, path, quote,
+  # space, end of line); an identifier is followed by `_`, and a method call by `(`.
+  '\.internal([^A-Za-z0-9_(]|$)'
   '100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}'
-  'ts\.net'
+  # Needs a boundary BEFORE the word. A bare `ts\.net` matched `parts.netloc` in `licenses`'
+  # models.py (the `t` of `parts` plus `.netloc`). A real MagicDNS name is preceded by `.` or a
+  # quote, never by an identifier character.
+  '(^|[^A-Za-z0-9_-])ts\.net'
   'strato-(server|vps)'
   'nonagenticai/gitops-production'
+  # A documented login into an address that only exists inside our network (measured: a public
+  # repo published `ssh mf1@192.168.1.119 "echo mf1 | sudo -S -u postgres psql …"`). RFC1918 alone
+  # stays a warning because test fixtures use it constantly; *reaching* one from a shell does not,
+  # which is what all three rules below have in common.
+  'ssh +[A-Za-z0-9._-]+@(192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.)'
+  'sudo +-[A-Za-z]*S'
+  # Estate machine names, but only where they are unambiguously a host. A bare name would be a
+  # false positive — `pgx` is the Go Postgres driver (`jackc/pgx`), and short identifiers like
+  # `hp1` appear in ordinary test data. So this names them only next to a login command or a DNS
+  # suffix, which is the two ways one actually gets written down.
+  '(ssh|scp|rsync) +[^ ]*(mf1|hp1|hp2|mini1|mini2|mini3|worker3)'
+  '(^|[^A-Za-z0-9_-])(mf1|hp1|hp2|mini1|mini2|mini3|worker3)\.(local|internal|ts\.net)([^A-Za-z0-9_-]|$)'
 )
 
 # Warnings only: RFC1918 literals are usually a test fixture, but they are still an address.

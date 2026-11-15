@@ -65,6 +65,55 @@ jobs:
       - name: no-private-refs (this tree)
         run: bash scripts/no-private-refs.sh
 
+      # A guard that has only ever been seen to pass is indistinguishable from one that cannot
+      # fail. This is the positive control: the exact shape that was published in a real public
+      # repository on 2026-11-15 and passed the guard — a documented login into a private address
+      # with the password piped into sudo's stdin flag. It must be refused, or the guard has
+      # regressed.
+      # The two negative controls beside it are ordinary code (`jackc/pgx`, a short identifier)
+      # that must NOT be refused; a guard that cries wolf is one people learn to ignore.
+      #
+      # The bad fixture is assembled from variables rather than written literally, because this
+      # file is itself tracked: written literally it would (correctly) fail the guard that runs
+      # two steps above. That is not evasion — the assembled string is byte-identical to the
+      # published one, and the assertion below proves the guard sees it.
+      - name: no-private-refs positive control (must FAIL on known-bad input)
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          cp scripts/no-private-refs.sh "$tmp/guard.sh"
+          cd "$tmp"
+          git init -q .
+          git config user.email selftest@invalid
+          git config user.name selftest
+
+          h='mf1'; ip='192.168.1.119'; k='S'; zone='internal'
+          {
+            printf -- '--     ssh %s@%s \\\n' "$h" "$ip"
+            printf -- '--       "echo %s | sudo -%s -u postgres psql -d postgres -f -" \\\n' "$h" "$k"
+          } > leaked.sql
+          {
+            printf 'host: postgres.%s\n' "$zone"
+            printf 'db: %s.local\n' "$h"
+          } > leaked.md
+          printf 'import _ "github.com/jackc/pgx/v5"\nvar hp1 = 3\n' > fine.go
+
+          git add -A
+          if bash guard.sh > out.txt 2>&1; then
+            echo "::error::the guard PASSED a tree containing a published login and internal hosts"
+            cat out.txt
+            exit 1
+          fi
+          for want in 'PRIVATE: leaked.sql' 'PRIVATE: leaked.md'; do
+            grep -qF "$want" out.txt || { echo "::error::expected '$want'"; cat out.txt; exit 1; }
+          done
+          if grep -qF 'fine.go' out.txt; then
+            echo "::error::false positive: ordinary code was refused"
+            grep -F 'fine.go' out.txt
+            exit 1
+          fi
+          echo "OK: refused the leak, ignored ordinary code"
+
   service:
     uses: ./.github/workflows/python-service.yml
     permissions:
