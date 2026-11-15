@@ -139,14 +139,14 @@ jobs:
         run: uv run ruff format --check --config "extend-exclude=['*.md']" .
 
       - name: Type check (ty)
-        # PINNED deliberately: ty is a CI TOOL, not a library, so its version belongs to the
-        # archetype rather than to each consumer's dependency graph. Unpinned (`uv run ty`) made
-        # Dependabot raise the same bump in 8 repos at once, and ty 0.0.100 turned 14 PRs red on
-        # diagnostics (`incompatible-mutable-override`, `missing-union-attribute`) that are real
-        # but not worth chasing in Python we are exiting. Move this pin, never the consumers.
+        # NEVER remove this step — see python-service.yml for the incident behind that rule.
+        # PINNED to the current release (PyPI latest, 0.0.104 on 2026-11-15): ty is a CI tool,
+        # not a library, so its version belongs to the archetype.
+        # `--exit-zero-on-warning` keeps third-party deprecation noise from failing the gate;
+        # error-level diagnostics still fail.
         env:
           SRC_DIR: ${{ inputs.src_dir }}
-        run: uvx ty@0.0.104 check "$SRC_DIR"
+        run: uvx ty@0.0.104 check "$SRC_DIR" --exit-zero-on-warning
 
       - name: Run tests
         env:

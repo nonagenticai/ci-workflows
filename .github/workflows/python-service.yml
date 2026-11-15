@@ -314,14 +314,23 @@ jobs:
         run: uv run ruff format --check --config "extend-exclude=['*.md']" .
 
       - name: Type check (ty)
+        # NEVER remove this step. A public CI file that comments the type gate out is how a major
+        # dependency bump merged green into a tree that no longer type-checked and could not be
+        # pushed to (worker_management, openai 2.41 → 3.49, 2026-11-15).
+        #
         # PINNED deliberately: ty is a CI TOOL, not a library, so its version belongs to the
-        # archetype rather than to each consumer's dependency graph. Unpinned (`uv run ty`) made
-        # Dependabot raise the same bump in 8 repos at once, and ty 0.0.100 turned 14 PRs red on
-        # diagnostics (`incompatible-mutable-override`, `missing-union-attribute`) that are real
-        # but not worth chasing in Python we are exiting. Move this pin, never the consumers.
+        # archetype rather than to each consumer's dependency graph. Keep the pin on the current
+        # release (PyPI latest, checked 2026-11-15: 0.0.104). Move this pin, never the consumers.
+        #
+        # `--exit-zero-on-warning` is NOT a soft gate: ty 0.0.104 exits 1 on warnings by default,
+        # and the warnings are in third-party code (pydantic-ai deprecations, Python 3.14's
+        # `asynccontextmanager` overloads) that consumers cannot fix. Error-level diagnostics
+        # still fail. Consumers that prefer the project-level switch use
+        # `[tool.ty.terminal] error-on-warning = false`; this flag makes the archetype agree with
+        # them without requiring it.
         env:
           SRC_DIR: ${{ inputs.src_dir }}
-        run: uvx ty@0.0.104 check "$SRC_DIR"
+        run: uvx ty@0.0.104 check "$SRC_DIR" --exit-zero-on-warning
 
       # Mirrors the archetype: use the project's own pytest-timeout when it has one, otherwise
       # inject one so a hung test cannot burn the whole job budget.
