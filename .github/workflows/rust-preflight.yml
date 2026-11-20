@@ -1,0 +1,160 @@
+name: rust-preflight-public
+
+# THE COMPILE GATE WITHOUT A LOCAL COMPILER.
+#
+# Why this workflow exists: every public Rust repository here used to learn "does it compile?"
+# from the git hook, which shipped the tree to a build host on the estate's private hardware
+# (rbuild → m1, four slots, exit 75 when busy). Ten sessions queued overnight behind one 8 GiB
+# Mac for an answer a free GitHub-hosted runner gives in minutes, in parallel, with no quota.
+# Compilation therefore belongs HERE, and never on a developer's box.
+#
+# What it is NOT: a second CI. It runs no test suite — `cargo nextest` is the PR workflow's job.
+# It answers one question with the two steps a Rust PR fails on before anything else: is the tree
+# formatted, and does `cargo clippy --all-targets -D warnings` pass. Because `--all-targets`
+# compiles the test and bench targets too, a type error in `tests/` fails here — the failure a
+# static analyser cannot see and a formatter cannot catch.
+#
+# Callers run the exported `rust-preflight` workflow from a small `preflight.yml`:
+#
+#   on:
+#     workflow_dispatch:
+#     push: {branches: ['lane/**', 'issue/**', 'slice/**']}
+#   concurrency: {group: 'preflight-${{ github.ref }}', cancel-in-progress: true}
+#   jobs:
+#     preflight:
+#       uses: nonagenticai/ci-workflows/.github/workflows/rust-preflight.yml@<sha>
+#       with: {package: conveyor, cache_shared_key: checks}
+#
+# A push-triggered preflight is deliberately NOT the lane rule's "never push to see what CI says".
+# That rule forbids using the PR as a compiler. This fires on the branch a session must push
+# anyway, is cancelled by its successor, and writes no required status.
+
+on:
+  workflow_call:
+    inputs:
+      working_directory:
+        description: "Workspace root, relative to the repository root (a Cargo.toml with [workspace])."
+        type: string
+        default: "."
+      package:
+        description: >
+          Cargo package to check (`-p`). Empty checks the whole workspace, which is the honest
+          default: a break in a sibling crate is still a break.
+        type: string
+        default: ""
+      clippy_args:
+        description: "Extra args between `clippy` and `--`. `--all-targets --locked` is not optional."
+        type: string
+        default: ""
+      cache_shared_key:
+        description: >
+          `shared-key` for Swatinem/rust-cache. Set it to the SAME value the repository's PR CI
+          uses (`checks` on conveyor, `rust` on agent) so this job restores the dependency cache
+          that the last `main` run saved instead of paying a cold compile. A preflight never
+          saves — `save-if` is main-only — so it cannot evict the cache it borrows.
+        type: string
+        default: "preflight"
+      needs_postgres:
+        description: >
+          Start Postgres 18 on 127.0.0.1:5432 before the compile. Off by default: a workspace
+          that avoids `sqlx::query!` (conveyor documents exactly that in `crates/store`) needs no
+          database to COMPILE. Turn it on only for a workspace whose build-time macros query.
+        type: boolean
+        default: false
+      timeout_minutes:
+        description: "Job cap. A cancelled run reports as *pending*, not red — keep headroom."
+        type: number
+        default: 30
+
+# Least privilege: this workflow reads a tree and compiles it. It never writes.
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      # Named once rather than written inline: a literal `name:tag` in a `docker` line trips the
+      # estate's upstream-ref lint, and the variable form is what the archetype already uses.
+      PG_IMAGE: postgres:18
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      # The toolchain follows `rust-toolchain.toml`, so this job compiles with the EXACT channel
+      # and components the repository pins — not whatever the runner image happens to carry. That
+      # is the difference between a preflight and a guess: a repo pinning an older channel is
+      # checked on that channel. `rustup show` installs a missing pin on demand.
+      - name: toolchain follows rust-toolchain.toml
+        run: |
+          set -euo pipefail
+          rustup show
+          rustc --version
+          cargo --version
+
+      # `swatinem/rust-cache`, not `actions/cache`: it prunes to its own budget and caches the
+      # DEPENDENCY graph without the workspace's own crates, which is where a cold Rust job
+      # spends most of its minutes. `env-vars` folds CARGO_PROFILE_DEV_DEBUG into the key so a
+      # profile change cannot silently reuse a target built the other way.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: v1-rust
+          shared-key: ${{ inputs.cache_shared_key }}
+          cache-all-crates: "false"
+          cache-on-failure: "false"
+          # A branch's own entry would be restored by nothing and would only evict the default
+          # branch's. Preflight is a CONSUMER of the cache the PR's main run writes.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          env-vars: CARGO_PROFILE_DEV_DEBUG
+
+      - name: start Postgres 18 (only when the workspace compiles against one)
+        if: ${{ inputs.needs_postgres }}
+        # --shm-size is load-bearing: Docker's default /dev/shm is 64 MiB and Postgres parallel
+        # workers allocate dynamic shared memory there (`53100 could not resize shared memory
+        # segment`). No --tmpfs for the data directory — a tmpfs is RAM-capped and a migrated
+        # database per test fills it (measured on the conveyor archetype). --rm so nothing leaks.
+        run: |
+          set -euo pipefail
+          docker run -d --rm --name preflight-pg \
+            -e POSTGRES_PASSWORD=postgres \
+            --shm-size=1g \
+            -p 127.0.0.1:5432:5432 \
+            "$PG_IMAGE" -c fsync=off -c max_connections=300
+          for _ in $(seq 1 60); do
+            docker exec preflight-pg pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker exec preflight-pg pg_isready -h 127.0.0.1 -U postgres
+
+      # Sub-second, and the single most common trivial red. It runs over the whole workspace
+      # (`--all`), not the touched files: rustfmt's verdict is about the committed tree.
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      # `--all-targets` is what makes this a compile gate rather than a lint: it builds the lib,
+      # every bin, every integration test, every bench and the build scripts. `-D warnings` is
+      # the same verdict the PR's CI job gives, so a warning here is a red there.
+      #
+      # The package name and the extra args reach the script through the ENVIRONMENT, never
+      # interpolated into `run:` — a caller-supplied expression inside a script is zizmor's
+      # template-injection finding, and this repository's own lint job gates that at medium.
+      - name: cargo clippy --all-targets -D warnings
+        env:
+          PKG: ${{ inputs.package }}
+          EXTRA: ${{ inputs.clippy_args }}
+        run: |
+          set -euo pipefail
+          args=(--all-targets --locked)
+          if [ -n "${PKG}" ]; then args+=(-p "${PKG}"); fi
+          if [ -n "${EXTRA}" ]; then
+            # shellcheck disable=SC2206 # deliberate word splitting: EXTRA is a flag list
+            args+=(${EXTRA})
+          fi
+          cargo clippy "${args[@]}" -- -D warnings

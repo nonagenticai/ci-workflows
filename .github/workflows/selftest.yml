@@ -201,6 +201,21 @@ jobs:
         docker rm -f selftest-go || true
         [ "$ok" -eq 1 ]
 
+  # Proves rust-preflight.yml end to end: `rustup show` resolves a toolchain without a pin,
+  # `cargo fmt --all -- --check` has a tree to judge, and `cargo clippy --all-targets -D warnings`
+  # compiles the fixture's lib, its unit-test module AND its `tests/` integration target. The
+  # package name is passed so the `-p` arm of the script is the arm under test — a `run:` string
+  # built by hand would be the zizmor template-injection finding this repository lints at medium.
+  #
+  # No `needs_postgres`: the fixture embeds no build-time query macros, and the flag's own value
+  # is proven by the fixture NOT connecting to anything.
+  rust-preflight:
+    uses: ./.github/workflows/rust-preflight.yml
+    with:
+      working_directory: fixtures/rust-app
+      package: rust-app-a
+      timeout_minutes: 15
+
   imageonly:
     uses: ./.github/workflows/image-only.yml
     permissions:
