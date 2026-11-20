@@ -263,3 +263,36 @@ jobs:
           docker run --rm "$IMAGE_REF" sh -c 'test "$GREETING" = hi'
           echo "published $IMAGE_REF still carries GREETING=hi"
 
+
+  # Proves rust-service.yml end to end. The fixture is the dependency-free workspace already
+  # beside rust-preflight's job: fmt and clippy have a tree to judge, and nextest is partitioned
+  # over TWO shards so the matrix and the `checks` aggregator are the arms under test, not just
+  # the single-shard default. `mode: package` proves the `-p` arm resolves from an input rather
+  # than a hand-built `run:` string. Postgres and Redis are started and deliberately never
+  # connected to — that proves the startup blocks (and their storage flags) without adding a
+  # client the archetype does not own. The image job builds fixtures/rust-app/Dockerfile, reads
+  # GREETING back from the built image (build-arg plumbing) and publishes on main.
+  rust-service:
+    uses: ./.github/workflows/rust-service.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      working_directory: fixtures/rust-app
+      package: rust-app-a
+      mode: package
+      shards: 2
+      pre_test_command: echo "selftest pre_test_command ran"
+      needs_postgres: true
+      needs_redis: true
+      cache_shared_key: checks
+      image_dockerfile: fixtures/rust-app/Dockerfile
+      image_build_args: |
+        GREETING=selftest
+      image_name: ci-workflows-rust-selftest
+      image_smoke: |
+        set -euo pipefail
+        docker run --rm "$IMAGE_REF" sh -c 'test "$GREETING" = selftest'
+        echo "build arg reached the image"
+      publish_image: true
+      timeout_minutes: 20
