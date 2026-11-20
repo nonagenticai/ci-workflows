@@ -1,0 +1,518 @@
+name: rust-service-public
+
+# ONE PUBLIC RUST SERVICE, START TO FINISH: scan the tree, then fmt + clippy + nextest
+# (partitioned over shards) + doctests + cargo audit, then optionally build the repository's own
+# Dockerfile and publish it to ghcr.io/<owner>/<image_name> from main.
+#
+# Why this file exists: six public Rust repositories each hand-roll `ci-public.yml`. They drifted
+# — different nextest pins, different Postgres flags, different shard conventions — and every
+# drift is a repository whose `green` means something different from its neighbour's. The
+# archetype is the single verdict; a defect fixed here is fixed in all six at once.
+#
+# The required check name is `checks`. It aggregates every shard, so raising `shards` never
+# renames the check a ruleset requires. Callers own their triggers; this file is
+# `workflow_call` only:
+#
+#   on: {pull_request: {}, push: {branches: [main]}}
+#   jobs:
+#     ci:
+#       uses: nonagenticai/ci-workflows/.github/workflows/rust-service.yml@<sha>
+#       permissions: {contents: read, packages: write}
+#       with: {package: conveyor, cache_shared_key: checks}
+#
+# Deliberately NOT here: the coding gate (it needs a private licence token, and a public
+# reusable workflow must not hold one) and the web/leptos build (its fixtures belong to the
+# caller). Both stay caller-local, on top of this archetype.
+#
+# The runner is fixed to `ubuntu-latest` and is not an input. A consumer that needs a bigger box
+# is a consumer whose suite needs looking at.
+
+on:
+  workflow_call:
+    inputs:
+      working_directory:
+        description: "Workspace root, relative to the repository root (a Cargo.toml with [workspace])."
+        type: string
+        default: "."
+      package:
+        description: >
+          Cargo package to lint and test (`-p`) when `mode: package`. Empty is only valid with
+          `mode: full`, where every workspace member is judged — which is the honest default:
+          a break in a sibling crate is still a break.
+        type: string
+        default: ""
+      mode:
+        description: >
+          `full` judges the whole workspace. `package` restricts clippy, nextest and doctests to
+          `package` (and fails the plan if `package` is empty). fmt and audit always judge the
+          whole workspace: a formatting or advisory verdict is about the committed tree.
+        type: string
+        default: "full"
+      test_command:
+        description: >
+          Shell run as the test step instead of nextest. Empty (the default) installs the pinned
+          nextest and runs `nextest run` plus `cargo test --doc` on shard 1. A non-empty value
+          runs on every shard with SHARD/SHARDS exported, and partitionning it is the caller's
+          job.
+        type: string
+        default: ""
+      shards:
+        description: >
+          Number of parallel test shards. Shard 1 also runs fmt, clippy, doctests, audit and
+          `pre_test_command` — the cheap gates must run once, not S times.
+        type: number
+        default: 1
+      pre_test_command:
+        description: "Shell run on shard 1 before the tests start (a DB bootstrap, a fixture copy)."
+        type: string
+        default: ""
+      needs_postgres:
+        description: >
+          Start Postgres on 127.0.0.1:5432 before the compile. Off by default: a workspace that
+          avoids `sqlx::query!` needs no database to COMPILE. Turn it on for a build whose
+          macros query, and for any integration test that opens one.
+        type: boolean
+        default: false
+      postgres_image:
+        description: "Image tag for the Postgres service."
+        type: string
+        default: "postgres:18"
+      needs_redis:
+        description: "Start Redis on 127.0.0.1:6379 before the compile."
+        type: boolean
+        default: false
+      redis_image:
+        description: "Image tag for the Redis service."
+        type: string
+        default: "library/redis:8.10.1-alpine"
+      cache_shared_key:
+        description: >
+          `shared-key` for Swatinem/rust-cache. Set it to the SAME value the repository's PR CI
+          uses (`checks` on conveyor, `rust` on agent) so this job restores the dependency cache
+          the last `main` run saved instead of paying a cold compile. Only main saves — a branch
+          cannot evict the cache it borrows.
+        type: string
+        default: "checks"
+      image_dockerfile:
+        description: >
+          Dockerfile to build, relative to the REPOSITORY ROOT. Empty disables the image job
+          entirely. The build context is always the repository root.
+        type: string
+        default: ""
+      image_build_args:
+        description: >
+          Newline-separated `KEY=VALUE` build args, one per line (a value may contain spaces).
+          Passed to buildx as `--build-arg` words, never interpolated into a shell string.
+        type: string
+        default: ""
+      image_name:
+        description: "Image name under ghcr.io/<repository owner>/. Required when image_dockerfile is set."
+        type: string
+        default: ""
+      image_smoke:
+        description: >
+          Shell run against the built image with $IMAGE_REF set to the local `:ci` tag. Empty
+          skips the smoke. The published tag is not smoked here: publish is main-only.
+        type: string
+        default: ""
+      publish_image:
+        description: >
+          Push the image from main. The image is BUILT on every run that supplies a Dockerfile,
+          whatever this flag says: a repo that is not deployed yet must still prove its
+          Dockerfile compiles, or the release is the first time anyone finds out.
+        type: boolean
+        default: false
+      run_scans:
+        description: "Run secret-scan and no-private-refs. Off only for a caller that runs them elsewhere."
+        type: boolean
+        default: true
+      run_checks:
+        description: >
+          Run fmt, clippy and cargo audit on shard 1. Tests and `pre_test_command` still run.
+        type: boolean
+        default: true
+      timeout_minutes:
+        description: "Job cap for the checks and image jobs. A cancelled run reports as *pending*, not red — keep headroom."
+        type: number
+        default: 120
+    outputs:
+      image_ref:
+        description: "Published ref (`:sha-<7>`) after a main publish. Empty when nothing was pushed."
+        value: ${{ jobs.image.outputs.image_ref }}
+
+# Least privilege by default; only the `image` job widens to packages: write, and only for the push.
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      shards: ${{ steps.list.outputs.shards }}
+    steps:
+      # The matrix cannot be computed from an integer input directly, and a bad input must fail
+      # ONCE, with a message — not S times inside the test output. `jq` is preinstalled on the
+      # runner; every input reaches the script through the environment, never interpolated
+      # into `run:`.
+      - name: Validate the inputs and enumerate the shards
+        id: list
+        env:
+          MODE: ${{ inputs.mode }}
+          PKG: ${{ inputs.package }}
+          SHARDS: ${{ inputs.shards }}
+          DOCKERFILE: ${{ inputs.image_dockerfile }}
+          IMAGE_NAME: ${{ inputs.image_name }}
+        run: |
+          set -euo pipefail
+          case "${MODE}" in
+            full|package) ;;
+            *) echo "::error::mode must be 'full' or 'package', got '${MODE}'"; exit 1 ;;
+          esac
+          if [ "${MODE}" = package ] && [ -z "${PKG}" ]; then
+            echo "::error::mode=package requires a non-empty package"; exit 1
+          fi
+          case "${SHARDS}" in
+            ''|*[!0-9]*) echo "::error::shards must be a positive integer, got '${SHARDS}'"; exit 1 ;;
+          esac
+          if [ "${SHARDS}" -lt 1 ]; then
+            echo "::error::shards must be >= 1, got '${SHARDS}'"; exit 1
+          fi
+          if [ -n "${DOCKERFILE}" ] && [ -z "${IMAGE_NAME}" ]; then
+            echo "::error::image_dockerfile is set but image_name is empty"; exit 1
+          fi
+          # shellcheck disable=SC2016 # $n is a jq variable, not a shell one
+          echo "shards=$(jq -cn --argjson n "${SHARDS}" '[range(1; $n + 1)]')" >> "$GITHUB_OUTPUT"
+
+  # The scans run the scripts on THIS repository's `main`, never a caller-supplied ref: a caller
+  # must not be able to choose the code these jobs execute.
+  secret-scan:
+    if: ${{ !github.event.repository.private && inputs.run_scans }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: nonagenticai/ci-workflows
+          ref: main
+          path: .ci-workflows
+          persist-credentials: false
+      - name: Scan the tree
+        run: bash .ci-workflows/scripts/secret-scan.sh
+
+  no-private-refs:
+    if: ${{ !github.event.repository.private && inputs.run_scans }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: nonagenticai/ci-workflows
+          ref: main
+          path: .ci-workflows
+          persist-credentials: false
+      - name: Scan tracked files
+        run: bash .ci-workflows/scripts/no-private-refs.sh
+
+  checks-shard:
+    if: ${{ !github.event.repository.private }}
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    permissions:
+      contents: read
+    strategy:
+      # One red shard must not cancel the others: the whole point of sharding is that the
+      # failure is pinned to a partition, and the log of the other partition is still evidence.
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    env:
+      # Drops the DWARF, which is what makes target/ multi-gigabyte.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      PG_IMAGE: ${{ inputs.postgres_image }}
+      REDIS_IMAGE: ${{ inputs.redis_image }}
+      # The names every hand-rolled consumer already exports, so a migrated caller's tests keep
+      # finding the services. Empty when the corresponding flag is off.
+      DATABASE_URL: ${{ inputs.needs_postgres && 'postgres://postgres:postgres@127.0.0.1:5432/postgres' || '' }}
+      TEST_DATABASE_URL: ${{ inputs.needs_postgres && 'postgres://postgres:postgres@127.0.0.1:5432/postgres' || '' }}
+      REDIS_URL: ${{ inputs.needs_redis && 'redis://127.0.0.1:6379/' || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      # The toolchain follows `rust-toolchain.toml`, so this job compiles with the EXACT channel
+      # and components the repository pins — not whatever the runner image happens to carry. That
+      # is the difference between a check and a guess: a repo pinning an older channel is
+      # checked on that channel. `rustup show` installs a missing pin on demand.
+      - name: toolchain follows rust-toolchain.toml
+        run: |
+          set -euo pipefail
+          rustup show
+          rustc --version
+          cargo --version
+
+      # `swatinem/rust-cache`, not `actions/cache`: it prunes to its own budget and caches the
+      # DEPENDENCY graph without the workspace's own crates, which is where a cold Rust job
+      # spends most of its minutes. `env-vars` folds CARGO_PROFILE_DEV_DEBUG into the key so a
+      # profile change cannot silently reuse a target built the other way.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: v1-rust
+          shared-key: ${{ inputs.cache_shared_key }}
+          cache-all-crates: "false"
+          cache-on-failure: "false"
+          # A branch's own entry would be restored by nothing and would only evict the default
+          # branch's. Only main saves; every PR and lane branch CONSUMES the cache main wrote.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          env-vars: CARGO_PROFILE_DEV_DEBUG
+
+      - name: start Postgres (only when the workspace compiles against one)
+        if: ${{ inputs.needs_postgres }}
+        # --shm-size is load-bearing: Docker's default /dev/shm is 64 MiB and Postgres parallel
+        # workers allocate dynamic shared memory there (`53100 could not resize shared memory
+        # segment`). No --tmpfs for the data directory — a tmpfs is RAM-capped and a migrated
+        # database per test fills it. --rm so nothing leaks.
+        run: |
+          set -euo pipefail
+          docker run -d --rm --name rust-service-pg \
+            -e POSTGRES_PASSWORD=postgres \
+            --shm-size=1g \
+            -p 127.0.0.1:5432:5432 \
+            "$PG_IMAGE" -c fsync=off -c max_connections=300
+          for _ in $(seq 1 60); do
+            docker exec rust-service-pg pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker exec rust-service-pg pg_isready -h 127.0.0.1 -U postgres
+
+      - name: start Redis (only when the workspace tests against a broker)
+        if: ${{ inputs.needs_redis }}
+        # Same storage reasoning as Postgres: no --tmpfs for the data directory. Redis is a test
+        # broker, not the datastore under test, and a RAM-capped append-only file fails inside a
+        # container where the test log cannot see it. --shm-size stays explicit for the same
+        # reason it is on Postgres: the 64 MiB default is not a budget to discover in a red run.
+        run: |
+          set -euo pipefail
+          docker run -d --rm --name rust-service-redis \
+            --shm-size=1g \
+            -p 127.0.0.1:6379:6379 \
+            "$REDIS_IMAGE"
+          for _ in $(seq 1 60); do
+            docker exec rust-service-redis redis-cli ping >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker exec rust-service-redis redis-cli ping
+
+      # Sub-second, and the single most common trivial red. It runs over the whole workspace
+      # (`--all`), not the touched files: rustfmt's verdict is about the committed tree.
+      - name: cargo fmt
+        if: ${{ inputs.run_checks && matrix.shard == 1 }}
+        run: cargo fmt --all -- --check
+
+      # `--all-targets` is what makes this a compile gate rather than a lint: it builds the lib,
+      # every bin, every integration test, every bench and the build scripts. `-D warnings` is
+      # the same verdict the PR's CI job gives, so a warning here is a red there.
+      #
+      # The package name and mode reach the script through the ENVIRONMENT, never interpolated
+      # into `run:` — a caller-supplied expression inside a script is zizmor's
+      # template-injection finding, and this repository's own lint job gates that at medium.
+      - name: cargo clippy --all-targets -D warnings
+        if: ${{ inputs.run_checks && matrix.shard == 1 }}
+        env:
+          PKG: ${{ inputs.package }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          args=(--all-targets --locked)
+          if [ "${MODE}" = package ]; then args+=(-p "${PKG}"); fi
+          cargo clippy "${args[@]}" -- -D warnings
+
+      - name: pre_test_command (shard 1 only)
+        if: ${{ matrix.shard == 1 && inputs.pre_test_command != '' }}
+        env:
+          PRE_TEST: ${{ inputs.pre_test_command }}
+        run: bash -c "${PRE_TEST}"
+
+      - name: cargo nextest (0.9.150 pinned, sha256-verified)
+        if: ${{ inputs.test_command == '' }}
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/nextest.tgz" \
+            "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.150/cargo-nextest-0.9.150-x86_64-unknown-linux-gnu.tar.gz"
+          echo "b0959bc64232974224cf9fb22c915845398c0e8668fa7831eb5b43fb1eef781f  $RUNNER_TEMP/nextest.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/nextest.tgz" -C "$RUNNER_TEMP" cargo-nextest
+          # Onto PATH, not just an absolute path: a workspace's own tests may invoke
+          # `cargo-nextest` by name, and a binary reachable only as
+          # "$RUNNER_TEMP/cargo-nextest" would make those pass here and fail elsewhere.
+          install -m 0755 "$RUNNER_TEMP/cargo-nextest" /usr/local/bin/cargo-nextest
+
+      - name: cargo nextest run (shard portion)
+        if: ${{ inputs.test_command == '' }}
+        env:
+          PKG: ${{ inputs.package }}
+          MODE: ${{ inputs.mode }}
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ inputs.shards }}
+        run: |
+          set -euo pipefail
+          args=(--no-fail-fast --no-tests=fail --color never --locked)
+          if [ "${MODE}" = package ]; then args+=(-p "${PKG}"); fi
+          # `slice:`, not the deprecated `count:`. Counted partitioning buckets per test BINARY
+          # and is neither even nor stable: measured on this repository's fixture, two binaries
+          # and two shards left shard 2 with zero tests. Slicing splits the selected tests
+          # evenly after every filter, so the union is the suite and the intersection is empty.
+          # Ask for no more shards than the suite has tests — `--no-tests=fail` says so loudly.
+          args+=(--partition "slice:${SHARD}/${SHARDS}")
+          cargo-nextest nextest run "${args[@]}"
+
+      # Doctests run in cargo, not nextest, so they are a separate step — on shard 1 only, or a
+      # four-shard run would execute them four times.
+      - name: cargo test --doc (shard 1 only)
+        if: ${{ inputs.test_command == '' && matrix.shard == 1 }}
+        env:
+          PKG: ${{ inputs.package }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          args=(--locked)
+          if [ "${MODE}" = package ]; then args+=(-p "${PKG}"); fi
+          cargo test --doc "${args[@]}"
+
+      - name: test_command (every shard; the caller owns partitioning)
+        if: ${{ inputs.test_command != '' }}
+        env:
+          TEST_COMMAND: ${{ inputs.test_command }}
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ inputs.shards }}
+        run: bash -c "${TEST_COMMAND}"
+
+      - name: cargo audit 0.22.2 (pinned, sha256-verified)
+        if: ${{ inputs.run_checks && matrix.shard == 1 }}
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/audit.tgz" \
+            "https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.2/cargo-audit-x86_64-unknown-linux-musl-v0.22.2.tgz"
+          echo "7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428  $RUNNER_TEMP/audit.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/audit.tgz" -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/cargo-audit-x86_64-unknown-linux-musl-v0.22.2/cargo-audit" audit
+
+  # The name a ruleset requires. It carries no work: it exists so `shards` can grow without the
+  # required check changing name, and so a shard that fails, is cancelled, or never starts reads
+  # as a red `checks` rather than a green partial.
+  checks:
+    if: ${{ always() && !github.event.repository.private }}
+    needs: [plan, checks-shard]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Every shard passed
+        env:
+          PLAN_RESULT: ${{ needs.plan.result }}
+          SHARD_RESULT: ${{ needs.checks-shard.result }}
+          SHARDS: ${{ inputs.shards }}
+        run: |
+          set -euo pipefail
+          if [ "${PLAN_RESULT}" != success ]; then
+            echo "::error::plan did not succeed (${PLAN_RESULT})"
+            exit 1
+          fi
+          if [ "${SHARD_RESULT}" != success ]; then
+            echo "::error::checks-shard did not succeed (${SHARD_RESULT})"
+            exit 1
+          fi
+          echo "all ${SHARDS} shard(s) passed"
+
+  # Build the image on every run that supplies a Dockerfile; PUSH it only from main when the
+  # caller says the service is deployed. ⛔ Gating the BUILD on `publish_image` would mean a repo
+  # that is not deployed yet never proves its Dockerfile compiles — the first time anyone found
+  # out was the release. On a fork PR the token is read-only and nothing is pushed anyway.
+  image:
+    if: ${{ !github.event.repository.private && inputs.image_dockerfile != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/${{ inputs.image_name }}
+    outputs:
+      image_ref: ${{ steps.publish.outputs.image_ref }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Disk headroom
+        run: df -h / | sed 's/^/  /'
+
+      # The gha cache exporter needs the docker-container driver; the runner's default `docker`
+      # driver has no cache-to support. Created by name so a retried job reuses nothing stale.
+      - name: buildx builder (the gha cache needs the container driver)
+        run: |
+          set -euo pipefail
+          docker buildx create --name rust-service --driver docker-container --use
+          docker buildx inspect --bootstrap
+
+      - name: Log in to ghcr (main publish only)
+        if: ${{ inputs.publish_image && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+
+      - name: Build image
+        env:
+          DOCKERFILE: ${{ inputs.image_dockerfile }}
+          BUILD_ARGS: ${{ inputs.image_build_args }}
+        run: |
+          set -euo pipefail
+          args=(--load --tag "${IMAGE}:ci" --file "${DOCKERFILE}")
+          # shellcheck disable=SC2054 # buildx cache attributes are comma-separated in ONE word
+          args+=(--cache-from type=gha --cache-to type=gha,mode=max)
+          while IFS= read -r arg; do
+            [ -n "${arg}" ] && args+=(--build-arg "${arg}")
+          done <<< "${BUILD_ARGS}"
+          docker buildx build "${args[@]}" .
+
+      - name: Smoke the built image
+        if: ${{ inputs.image_smoke != '' }}
+        env:
+          IMAGE_REF: ${{ env.IMAGE }}:ci
+          SMOKE: ${{ inputs.image_smoke }}
+        run: bash -c "${SMOKE}"
+
+      - name: Publish (main only)
+        id: publish
+        if: ${{ inputs.publish_image && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+        env:
+          DOCKERFILE: ${{ inputs.image_dockerfile }}
+          BUILD_ARGS: ${{ inputs.image_build_args }}
+        run: |
+          set -euo pipefail
+          short="${GITHUB_SHA:0:7}"
+          args=(--push --provenance=mode=max --file "${DOCKERFILE}")
+          # shellcheck disable=SC2054 # buildx cache attributes are comma-separated in ONE word
+          args+=(--cache-from type=gha --cache-to type=gha,mode=max)
+          while IFS= read -r arg; do
+            [ -n "${arg}" ] && args+=(--build-arg "${arg}")
+          done <<< "${BUILD_ARGS}"
+          args+=(--tag "${IMAGE}:sha-${short}" --tag "${IMAGE}:latest")
+          docker buildx build "${args[@]}" .
+          echo "published ${IMAGE}:sha-${short}"
+          echo "image_ref=${IMAGE}:sha-${short}" >> "$GITHUB_OUTPUT"
