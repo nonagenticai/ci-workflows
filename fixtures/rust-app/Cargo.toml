@@ -1,0 +1,6 @@
+# A dependency-free workspace. Deliberately no crates.io dependency: the selftest proves the
+# WORKFLOW (toolchain pin, fmt, `clippy --all-targets -D warnings`, the env-passed package arg),
+# and a network fetch would only make that proof slower and flakier.
+[workspace]
+resolver = "2"
+members = ["crate-a"]
