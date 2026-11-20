@@ -371,9 +371,12 @@ jobs:
           set -euo pipefail
           args=(--no-fail-fast --no-tests=fail --color never --locked)
           if [ "${MODE}" = package ]; then args+=(-p "${PKG}"); fi
-          # Every shard partitions the SAME selected set, so the union is the full suite and the
-          # intersection is empty. `--no-tests=fail` catches a partition that selected nothing.
-          args+=(--partition "count:${SHARDS}/${SHARD}")
+          # `slice:`, not the deprecated `count:`. Counted partitioning buckets per test BINARY
+          # and is neither even nor stable: measured on this repository's fixture, two binaries
+          # and two shards left shard 2 with zero tests. Slicing splits the selected tests
+          # evenly after every filter, so the union is the suite and the intersection is empty.
+          # Ask for no more shards than the suite has tests — `--no-tests=fail` says so loudly.
+          args+=(--partition "slice:${SHARD}/${SHARDS}")
           cargo-nextest nextest run "${args[@]}"
 
       # Doctests run in cargo, not nextest, so they are a separate step — on shard 1 only, or a
